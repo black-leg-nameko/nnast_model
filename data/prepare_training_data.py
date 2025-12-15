@@ -69,8 +69,13 @@ class TrainingDataPreparer:
         graph_file = processed_dir / f"{commit_hash}_{file_stem}_{version}.jsonl"
         
         if not graph_file.exists():
-            # Try to generate CPG graph on the fly
-            return self._generate_cpg_on_fly(record, version)
+            # Try to generate CPG graph on the fly from code file
+            code_file_key = f"code_{version}_file"
+            if code_file_key in record:
+                code_file = self.dataset_dir / record[code_file_key]
+                if code_file.exists():
+                    return self._generate_cpg_from_file(code_file)
+            return None
         
         with open(graph_file, "r") as f:
             for line in f:
@@ -82,6 +87,28 @@ class TrainingDataPreparer:
                     return graph
                 except json.JSONDecodeError:
                     continue
+        
+        return None
+    
+    def _generate_cpg_from_file(self, code_file: pathlib.Path) -> Optional[Dict]:
+        """Generate CPG graph from code file."""
+        import subprocess
+        import sys
+        
+        try:
+            result = subprocess.run(
+                [sys.executable, "-m", "cli", str(code_file), "--out", "/dev/stdout"],
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+            
+            if result.returncode == 0:
+                lines = result.stdout.strip().split('\n')
+                if lines:
+                    return json.loads(lines[0])
+        except Exception as e:
+            print(f"  Warning: Failed to generate CPG from {code_file}: {e}")
         
         return None
     

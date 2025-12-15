@@ -15,6 +15,7 @@ The collected data is structured for NNAST training:
 """
 import argparse
 import json
+import os
 import pathlib
 import subprocess
 import sys
@@ -22,6 +23,41 @@ from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, asdict
 from datetime import datetime
 import re
+import time
+
+from data.github_api import GitHubAPIClient, GitHubCommit, CodeDiff
+
+
+def load_env_file(env_path: Optional[pathlib.Path] = None) -> None:
+    """
+    Load environment variables from .env file.
+    
+    Simple implementation without external dependencies.
+    """
+    if env_path is None:
+        # Look for .env in project root
+        project_root = pathlib.Path(__file__).parent.parent
+        env_path = project_root / ".env"
+    
+    if env_path.exists():
+        with open(env_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                # Skip comments and empty lines
+                if not line or line.startswith("#"):
+                    continue
+                # Parse KEY=VALUE format
+                if "=" in line:
+                    key, value = line.split("=", 1)
+                    key = key.strip()
+                    value = value.strip().strip('"').strip("'")
+                    # Only set if not already in environment
+                    if key and key not in os.environ:
+                        os.environ[key] = value
+
+
+# Load .env file if it exists
+load_env_file()
 
 
 @dataclass
@@ -56,30 +92,172 @@ class DatasetCollector:
         self.raw_data_dir.mkdir(exist_ok=True)
         self.processed_data_dir.mkdir(exist_ok=True)
     
-    def collect_from_github_cve(self, query: str = "language:python CVE", limit: int = 100) -> List[Dict]:
+    def collect_from_github_cve(
+        self,
+        query: str = "CVE",
+        language: str = "python",
+        limit: int = 100
+    ) -> List[VulnerabilityRecord]:
         """
         Collect Python vulnerabilities from GitHub using search API.
         
-        Note: Requires GitHub API token in GITHUB_TOKEN environment variable.
+        Args:
+            query: Search query (e.g., "CVE", "security fix", "vulnerability")
+            language: Programming language filter
+            limit: Maximum number of records to collect
+            
+        Returns:
+            List of VulnerabilityRecord objects
         """
         import os
         
         token = os.getenv("GITHUB_TOKEN")
         if not token:
             print("Warning: GITHUB_TOKEN not set. GitHub collection will be skipped.")
+            print("Set GITHUB_TOKEN environment variable to enable GitHub API access.")
             return []
         
-        # Use GitHub CLI or API to search
-        # This is a placeholder - actual implementation would use GitHub API
-        print(f"Searching GitHub for: {query} (limit: {limit})")
-        print("Note: Full GitHub API integration requires API token setup")
+        print(f"Collecting Python vulnerabilities from GitHub...")
+        print(f"Query: {query}, Language: {language}, Limit: {limit}")
         
-        # Placeholder: return empty list for now
-        # In production, this would:
-        # 1. Search GitHub for Python CVE-related commits
-        # 2. Extract commit hashes, file paths, code diffs
-        # 3. Parse CVE/CWE information from commit messages
-        return []
+        # Initialize GitHub API client
+        client = GitHubAPIClient(token)
+        
+        # Search for CVE-related commits
+        commits = client.search_commits(query=query, language=language, limit=limit)
+        
+        if not commits:
+            print("No commits found.")
+            return []
+        
+        records = []
+        processed = 0
+        
+        for commit in commits:
+            if processed >= limit:
+                break
+            
+            print(f"\nProcessing commit {commit.sha[:8]} from {commit.repo_name}...")
+            
+            # Parse repository owner and name
+            repo_parts = commit.repo_name.split("/")
+            if len(repo_parts) != 2:
+                print(f"  Warning: Invalid repo name format: {commit.repo_name}")
+                continue
+            
+            owner, repo = repo_parts
+            
+            # Get commit details including file changes
+            commit_details = client.get_commit_details(owner, repo, commit.sha)
+            if not commit_details:
+                print(f"  Warning: Could not get commit details")
+                continue
+            
+            # Get parent commit (vulnerable version)
+            parent_sha = client.get_parent_commit(owner, repo, commit.sha)
+            if not parent_sha:
+                print(f"  Warning: Could not get parent commit")
+                continue
+            
+            # Get file changes
+            diffs = client.get_commit_diff(owner, repo, commit.sha)
+            if not diffs:
+                print(f"  Warning: No Python file changes found")
+                continue
+            
+            # Process each changed file
+            for diff in diffs:
+                if processed >= limit:
+                    break
+                
+                file_path = diff.file_path
+                print(f"  Processing file: {file_path}")
+                
+                # Get file content before fix (parent commit)
+                code_before = client.get_file_content(owner, repo, file_path, parent_sha)
+                if not code_before:
+                    print(f"    Warning: Could not get file content before fix")
+                    continue
+                
+                # Get file content after fix (current commit)
+                code_after = client.get_file_content(owner, repo, file_path, commit.sha)
+                if not code_after:
+                    print(f"    Warning: Could not get file content after fix")
+                    continue
+                
+                # Create vulnerability record
+                record = VulnerabilityRecord(
+                    cve_id=commit.cve_id,
+                    cwe_id=commit.cwe_id,
+                    repo_url=commit.repo_url,
+                    commit_before=parent_sha,
+                    commit_after=commit.sha,
+                    file_path=file_path,
+                    line_range_before=(1, len(code_before.splitlines())),
+                    line_range_after=(1, len(code_after.splitlines())),
+                    vulnerability_type=commit.vulnerability_type or "Unknown",
+                    description=commit.message[:500],  # Truncate long messages
+                    code_before=code_before,
+                    code_after=code_after
+                )
+                
+                records.append(record)
+                processed += 1
+                
+                # Save record immediately
+                self._save_record_immediate(record)
+                
+                # Small delay to respect rate limits
+                time.sleep(0.5)
+        
+        print(f"\nCollected {len(records)} vulnerability records")
+        return records
+    
+    def _save_record_immediate(self, record: VulnerabilityRecord):
+        """Save a single record immediately (for progress tracking)."""
+        # Save code files separately (they can be large)
+        code_dir = self.output_dir / "code"
+        code_dir.mkdir(exist_ok=True)
+        
+        # Save code before
+        code_before_file = code_dir / f"{record.commit_before}_{pathlib.Path(record.file_path).name}_before.py"
+        code_before_file.parent.mkdir(parents=True, exist_ok=True)
+        code_before_file.write_text(record.code_before, encoding="utf-8")
+        
+        # Save code after
+        code_after_file = code_dir / f"{record.commit_after}_{pathlib.Path(record.file_path).name}_after.py"
+        code_after_file.parent.mkdir(parents=True, exist_ok=True)
+        code_after_file.write_text(record.code_after, encoding="utf-8")
+        
+        # Save metadata (with file paths instead of full code)
+        metadata = {
+            "cve_id": record.cve_id,
+            "cwe_id": record.cwe_id,
+            "repo_url": record.repo_url,
+            "commit_before": record.commit_before,
+            "commit_after": record.commit_after,
+            "file_path": record.file_path,
+            "vulnerability_type": record.vulnerability_type,
+            "description": record.description,
+            "code_before_file": str(code_before_file.relative_to(self.output_dir)),
+            "code_after_file": str(code_after_file.relative_to(self.output_dir)),
+            "timestamp": datetime.now().isoformat(),
+        }
+        
+        with open(self.metadata_file, "a") as f:
+            f.write(json.dumps(metadata, ensure_ascii=False) + "\n")
+        
+        # Generate and save CPG graphs
+        graph_before, graph_after = self.generate_cpg_graphs(record)
+        if graph_before:
+            graph_file_before = self.processed_data_dir / f"{record.commit_before}_{pathlib.Path(record.file_path).stem}_before.jsonl"
+            with open(graph_file_before, "w") as f:
+                f.write(json.dumps(graph_before, ensure_ascii=False) + "\n")
+        
+        if graph_after:
+            graph_file_after = self.processed_data_dir / f"{record.commit_after}_{pathlib.Path(record.file_path).stem}_after.jsonl"
+            with open(graph_file_after, "w") as f:
+                f.write(json.dumps(graph_after, ensure_ascii=False) + "\n")
     
     def collect_from_cve_database(self, cve_list: Optional[List[str]] = None) -> List[Dict]:
         """
@@ -117,6 +295,8 @@ class DatasetCollector:
         """
         Process a repository to extract vulnerable and fixed code.
         
+        Uses GitHub API if available, otherwise falls back to git clone.
+        
         Args:
             repo_url: GitHub repository URL
             commit_before: Commit hash of vulnerable version
@@ -126,9 +306,57 @@ class DatasetCollector:
         Returns:
             VulnerabilityRecord if successful, None otherwise
         """
+        import os
+        
         print(f"Processing {repo_url} ({commit_before} -> {commit_after})")
         
-        # Clone repository temporarily
+        # Try GitHub API first
+        token = os.getenv("GITHUB_TOKEN")
+        if token:
+            try:
+                # Parse repo URL to get owner/repo
+                # Format: https://github.com/owner/repo or git@github.com:owner/repo.git
+                if "github.com" in repo_url:
+                    parts = repo_url.replace("https://github.com/", "").replace("git@github.com:", "").replace(".git", "").split("/")
+                    if len(parts) >= 2:
+                        owner, repo = parts[0], parts[1]
+                        
+                        client = GitHubAPIClient(token)
+                        
+                        # Get commit messages for metadata
+                        commit_details = client.get_commit_details(owner, repo, commit_after)
+                        if commit_details:
+                            message = commit_details.get("commit", {}).get("message", "")
+                            cve_id = client._extract_cve_id(message)
+                            cwe_id = client._extract_cwe_id(message)
+                            vuln_type = client._extract_vulnerability_type(message)
+                        else:
+                            cve_id = cwe_id = vuln_type = None
+                        
+                        # Get file content
+                        code_before = client.get_file_content(owner, repo, file_path, commit_before)
+                        code_after = client.get_file_content(owner, repo, file_path, commit_after)
+                        
+                        if code_before and code_after:
+                            record = VulnerabilityRecord(
+                                cve_id=cve_id,
+                                cwe_id=cwe_id,
+                                repo_url=repo_url,
+                                commit_before=commit_before,
+                                commit_after=commit_after,
+                                file_path=file_path,
+                                line_range_before=(1, len(code_before.splitlines())),
+                                line_range_after=(1, len(code_after.splitlines())),
+                                vulnerability_type=vuln_type or "Unknown",
+                                description=message[:500] if commit_details else "",
+                                code_before=code_before,
+                                code_after=code_after
+                            )
+                            return record
+            except Exception as e:
+                print(f"  Warning: GitHub API failed, falling back to git clone: {e}")
+        
+        # Fallback to git clone
         temp_dir = self.raw_data_dir / f"repo_{hash(repo_url)}"
         
         try:
@@ -167,11 +395,8 @@ class DatasetCollector:
             # Read fixed code
             code_after = vulnerable_file.read_text(encoding="utf-8")
             
-            # Extract metadata from git log
-            # This is simplified - in production, would parse commit messages for CVE/CWE
-            
             record = VulnerabilityRecord(
-                cve_id=None,  # Would be extracted from commit message
+                cve_id=None,
                 cwe_id=None,
                 repo_url=repo_url,
                 commit_before=commit_before,
@@ -179,8 +404,8 @@ class DatasetCollector:
                 file_path=file_path,
                 line_range_before=(1, len(code_before.splitlines())),
                 line_range_after=(1, len(code_after.splitlines())),
-                vulnerability_type="Unknown",  # Would be extracted from CVE/CWE
-                description="",  # Would be extracted from commit message
+                vulnerability_type="Unknown",
+                description="",
                 code_before=code_before,
                 code_after=code_after
             )
@@ -290,8 +515,7 @@ def main():
     )
     parser.add_argument(
         "--github-query",
-        default="language:python CVE",
-        help="GitHub search query"
+        help="GitHub search query (e.g., 'CVE', 'security fix'). If not provided, GitHub collection is skipped."
     )
     parser.add_argument(
         "--limit",
@@ -343,15 +567,26 @@ def main():
             records_collected += 1
     
     # Collect from GitHub
-    github_records = collector.collect_from_github_cve(args.github_query, args.limit)
-    # Process GitHub records...
+    if args.github_query:
+        github_records = collector.collect_from_github_cve(
+            query=args.github_query,
+            language="python",
+            limit=args.limit
+        )
+        records_collected += len(github_records)
     
     # Collect from CVE database
-    cve_records = collector.collect_from_cve_database(args.cve_list)
-    # Process CVE records...
+    if args.cve_list:
+        cve_records = collector.collect_from_cve_database(args.cve_list)
+        records_collected += len(cve_records)
     
-    print(f"\nCollected {records_collected} vulnerability record(s)")
+    print(f"\n{'='*60}")
+    print(f"Collection complete!")
+    print(f"Total records collected: {records_collected}")
     print(f"Dataset saved to: {output_dir}")
+    print(f"  - Metadata: {collector.metadata_file}")
+    print(f"  - CPG graphs: {collector.processed_data_dir}")
+    print(f"{'='*60}")
 
 
 if __name__ == "__main__":
