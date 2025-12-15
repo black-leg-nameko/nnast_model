@@ -31,6 +31,6 @@ class CPGGraph:
     def to_dict(self):
         return {
             "file": self.file,
-            "nodes": [asdict(n) for n in self.nodes]
+            "nodes": [asdict(n) for n in self.nodes],
             "edges": [asdict(e) for e in self.edges]
         }

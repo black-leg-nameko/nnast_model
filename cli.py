@@ -2,10 +2,10 @@
 import argparse
 import pathlib
 
-from nnast.cpg.parse import parse_source
-from nnast.cpg.build_ast import ASTCPGBuilder
-from nnast.ir.schema import CPGGraph
-from nnast.ir.io import write_graph_jsonl
+from cpg.parse import parse_source
+from cpg.build_ast import ASTCPGBuilder
+from ir.schema import CPGGraph
+from ir.io import write_graph_jsonl
 
 
 def iter_py_files(root: pathlib.Path):

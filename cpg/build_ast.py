@@ -1,7 +1,8 @@
 import ast
-from typing import List, Tuple
-fro mnnast.ir.schema import CPGNode, CPGEdge
-from nnast.cpg.parse import get_span, extract_code
+from typing import List, Tuple, Optional
+
+from ir.schema import CPGNode, CPGEdge
+from cpg.parse import get_span, extract_code
 
 
 KIND_MAP = {
@@ -10,11 +11,17 @@ KIND_MAP = {
     ast.AsyncFunctionDef: "Function",
     ast.ClassDef: "Class",
     ast.Assign: "Assign",
+    ast.AnnAssign: "AnnAssign",
+    ast.AugAssign: "AugAssign",
     ast.Return: "Return",
     ast.Call: "Call",
     ast.Name: "Name",
     ast.Attribute: "Attribute",
     ast.Constant: "Literal",
+    ast.arg: "Arg",
+    ast.arguments: "Arguments",
+    ast.JoinedStr: "JoinedStr",
+    ast.FormattedValue: "FormattedValue",
 }
 
 
@@ -32,12 +39,28 @@ class ASTCPGBuilder(ast.NodeVisitor):
         self._id += 1
         return self._id
 
+    def _annotation_str(self, annotation: Optional[ast.AST]) -> Optional[str]:
+        if annotation is None:
+            return None
+        try:
+            return ast.unparse(annotation)
+        except Exception:
+            return None
+
 
     def generic_visit(self, node):
+        total_lines = len(self.source_lines)
+        last_line_len = len(self.source_lines[-1]) if self.source_lines else 0
+
+        span = get_span(node, total_lines=total_lines, last_line_len=last_line_len)
+        if span is None:
+            # Skip nodes without positions but still traverse children
+            super().generic_visit(node)
+            return
+
         node_id = self._new_id()
         kind = KIND_MAP.get(type(node), "Stmt")
 
-        span = get_span(node)
         code = extract_code(self.source_lines, span)
 
         symbol = None
@@ -45,16 +68,27 @@ class ASTCPGBuilder(ast.NodeVisitor):
             symbol = node.name
         elif isinstance(node, ast.Name):
             symbol = node.id
+        elif isinstance(node, ast.arg):
+            symbol = node.arg
+
+        type_hint = None
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            type_hint = self._annotation_str(node.returns)
+        elif isinstance(node, ast.arg):
+            type_hint = self._annotation_str(node.annotation)
+        elif isinstance(node, ast.AnnAssign):
+            type_hint = self._annotation_str(node.annotation)
 
         cpg_node = CPGNode(
             id=node_id,
-            kind=kind
+            kind=kind,
             file=self.file,
             span=span,
             code=code,
             symbol=symbol,
+            type_hint=type_hint,
             flags=[],
-            attrs={}
+            attrs={},
         )
         self.nodes.append(cpg_node)
 
