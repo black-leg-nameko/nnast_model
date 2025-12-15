@@ -47,16 +47,23 @@ def train_epoch(
     total = 0
     
     pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
-    for batch_graphs, batch_taint_info in pbar:
+    for batch_graphs, batch_info in pbar:
         batch_graphs = batch_graphs.to(device)
         
-        # For now, use a simple binary classification task:
-        # 1 if graph has taint info, 0 otherwise
-        labels = torch.tensor(
-            [1 if info is not None else 0 for info in batch_taint_info],
-            dtype=torch.long,
-            device=device
-        )
+        # Extract labels from batch_info
+        # Priority: explicit label > taint info > default (0)
+        labels_list = []
+        for info in batch_info:
+            if info is None:
+                labels_list.append(0)
+            elif "label" in info:
+                # Explicit label from labels JSONL
+                labels_list.append(info["label"])
+            else:
+                # Taint info available (label as 1)
+                labels_list.append(1)
+        
+        labels = torch.tensor(labels_list, dtype=torch.long, device=device)
         
         # Forward pass
         optimizer.zero_grad()
@@ -100,14 +107,20 @@ def evaluate(
     total = 0
     
     with torch.no_grad():
-        for batch_graphs, batch_taint_info in tqdm(dataloader, desc="Evaluating"):
+        for batch_graphs, batch_info in tqdm(dataloader, desc="Evaluating"):
             batch_graphs = batch_graphs.to(device)
             
-            labels = torch.tensor(
-                [1 if info is not None else 0 for info in batch_taint_info],
-                dtype=torch.long,
-                device=device
-            )
+            # Extract labels from batch_info
+            labels_list = []
+            for info in batch_info:
+                if info is None:
+                    labels_list.append(0)
+                elif "label" in info:
+                    labels_list.append(info["label"])
+                else:
+                    labels_list.append(1)
+            
+            labels = torch.tensor(labels_list, dtype=torch.long, device=device)
             
             logits = model(batch_graphs)
             loss = criterion(logits, labels)
@@ -138,6 +151,10 @@ def main():
     parser.add_argument(
         "--taint-log",
         help="Path to taint records JSONL file (optional)"
+    )
+    parser.add_argument(
+        "--labels",
+        help="Path to labels JSONL file (for supervised learning)"
     )
     parser.add_argument(
         "--output-dir",
@@ -230,6 +247,7 @@ def main():
     dataset = CPGGraphDataset(
         graph_jsonl_path=args.graphs,
         taint_jsonl_path=args.taint_log,
+        labels_jsonl_path=args.labels,
         embedder=embedder,
         max_nodes=args.max_nodes,
     )
