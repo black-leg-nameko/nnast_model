@@ -37,3 +37,9 @@ htmlcov/
 tmp/
 tmp_*/
 tmp_sample/*
+
+# Model checkpoints (large binary files)
+checkpoints*/
+*.pt
+*.pth
+*.ckpt

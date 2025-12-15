@@ -159,11 +159,16 @@ class CPGGraphDataset(Dataset):
         )
         
         # Create PyG Data object
+        # Store CodeBERT embeddings separately for dynamic attention mechanism
+        codebert_emb = torch.tensor(node_embeddings, dtype=torch.float32)
+        
         data = Data(
-            x=torch.tensor(node_embeddings, dtype=torch.float32),
+            x=codebert_emb,  # Initial node features (CodeBERT embeddings)
             edge_index=edge_index,
             edge_attr=edge_attr,
             num_nodes=num_nodes,
+            # Store CodeBERT embeddings for dynamic attention fusion
+            codebert_emb=codebert_emb,  # Keep original CodeBERT embeddings
             # Store additional metadata
             node_kinds=node_kind_features,
             node_ids=torch.tensor([n["id"] for n in nodes], dtype=torch.long),
