@@ -1,0 +1,39 @@
+__pycache__/
+*.py[cod]
+*$py.class
+cpg/__pycache__/
+ir/__pycache__/
+dta/__pycache__/
+
+# Virtual environments
+.venv/
+env/
+venv/
+.env
+
+# Packaging / build
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Python tooling caches
+.pytest_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS cruft
+.DS_Store
+
+# Project-specific temp data
+tmp/
+tmp_*/
+tmp_sample/*
