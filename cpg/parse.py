@@ -23,12 +23,23 @@ def extract_code(source_lines, span):
     if span is None:
         return None
     sl, sc, el, ec = span
-    if sl <= 0 or sl > len(source_lines):
+    if sl <= 0 or sl > len(source_lines) or el <= 0:
         return None
+    # Adjust el to bounds of source_lines
+    el = min(el, len(source_lines))
+
     if sl == el:
         return source_lines[sl - 1][sc:ec]
-    # Multi-line snippet: take from start line start col to its end for now
-    return source_lines[sl - 1][sc:]
+
+    lines = []
+    # first line
+    lines.append(source_lines[sl - 1][sc:])
+    # middle lines
+    if el - sl > 1:
+        lines.extend(source_lines[sl:el - 1])
+    # last line
+    lines.append(source_lines[el - 1][:ec])
+    return "\n".join(lines)
 
 
 def parse_source(source: str) -> ast.AST:
