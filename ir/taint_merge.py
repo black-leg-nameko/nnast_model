@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Iterable
 
 from ir.schema import CPGGraph, CPGEdge, CPGNode
 
@@ -135,3 +135,88 @@ def add_ddfg_from_record(graph: CPGGraph, record: Dict[str, Any]) -> None:
             continue
         graph.edges.append(CPGEdge(src=a, dst=b, kind="DDFG", attrs=meta_attrs or None))
         existing.add(key)
+
+
+def add_ddfg_from_records(graph: CPGGraph, records: Iterable[Dict[str, Any]]) -> None:
+    """Add DDFG edges for all taint records in an iterable."""
+    for rec in records:
+        add_ddfg_from_record(graph, rec)
+
+
+def normalize_taint_record(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Convert a raw taint record from various DTA tools into our canonical format.
+
+    Supports common formats:
+    - Our canonical format (pass-through)
+    - tainted-like format with "taint_source" / "taint_sink" / "trace"
+    - Generic format with "from" / "to" / "via"
+
+    Returns None if the record cannot be normalized.
+    """
+    # Already in canonical format?
+    if "source" in raw and "sink" in raw:
+        src_pos = _extract_position(raw["source"])
+        sink_pos = _extract_position(raw["sink"])
+        if src_pos is not None and sink_pos is not None:
+            return raw
+        # If source/sink exist but aren't valid positions, fall through to try other formats
+
+    result: Dict[str, Any] = {}
+
+    # Try tainted-like format: {"taint_source": {...}, "taint_sink": {...}, "trace": [...]}
+    if "taint_source" in raw and "taint_sink" in raw:
+        src_raw = raw["taint_source"]
+        sink_raw = raw["taint_sink"]
+        result["source"] = _extract_position(src_raw)
+        result["sink"] = _extract_position(sink_raw)
+        if "trace" in raw:
+            result["path"] = [_extract_position(p) for p in raw["trace"] if _extract_position(p)]
+        if "taint_type" in raw:
+            result.setdefault("meta", {})["taint_kind"] = str(raw["taint_type"])
+        if "sink_type" in raw:
+            result.setdefault("meta", {})["sink_type"] = str(raw["sink_type"])
+        return result if result.get("source") and result.get("sink") else None
+
+    # Try generic format: {"from": {...}, "to": {...}, "via": [...]}
+    if "from" in raw and "to" in raw:
+        result["source"] = _extract_position(raw["from"])
+        result["sink"] = _extract_position(raw["to"])
+        if "via" in raw:
+            result["path"] = [_extract_position(p) for p in raw["via"] if _extract_position(p)]
+        # Copy any other keys as meta
+        meta = {k: str(v) for k, v in raw.items() if k not in ("from", "to", "via")}
+        if meta:
+            result["meta"] = meta
+        return result if result.get("source") and result.get("sink") else None
+
+    return None
+
+
+def _extract_position(obj: Any) -> Optional[Position]:
+    """Extract a Position dict from various formats."""
+    if not isinstance(obj, dict):
+        return None
+
+    # Already in {"file": ..., "line": ..., "col": ...} format?
+    if "file" in obj and "line" in obj:
+        pos: Position = {"file": str(obj["file"]), "line": int(obj["line"])}
+        if "col" in obj:
+            pos["col"] = int(obj["col"])
+        return pos
+
+    # Try {"filename": ..., "lineno": ..., "column": ...}
+    if "filename" in obj and "lineno" in obj:
+        pos = {"file": str(obj["filename"]), "line": int(obj["lineno"])}
+        if "column" in obj:
+            pos["col"] = int(obj["column"])
+        return pos
+
+    # Try {"path": ..., "line": ..., "column": ...}
+    if "path" in obj and "line" in obj:
+        pos = {"file": str(obj["path"]), "line": int(obj["line"])}
+        if "column" in obj:
+            pos["col"] = int(obj["column"])
+        return pos
+
+    return None
