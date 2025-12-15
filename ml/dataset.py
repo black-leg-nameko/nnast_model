@@ -20,6 +20,7 @@ class CPGGraphDataset(Dataset):
         self,
         graph_jsonl_path: str,
         taint_jsonl_path: Optional[str] = None,
+        labels_jsonl_path: Optional[str] = None,
         embedder: Optional[CodeBERTEmbedder] = None,
         max_nodes: int = 1000,
         cache_embeddings: bool = True,
@@ -30,12 +31,14 @@ class CPGGraphDataset(Dataset):
         Args:
             graph_jsonl_path: Path to JSONL file containing CPG graphs
             taint_jsonl_path: Optional path to JSONL file containing taint records
+            labels_jsonl_path: Optional path to JSONL file containing labels (for supervised learning)
             embedder: CodeBERT embedder instance (will create if None)
             max_nodes: Maximum number of nodes per graph (for padding/truncation)
             cache_embeddings: Whether to cache embeddings in memory
         """
         self.graph_jsonl_path = pathlib.Path(graph_jsonl_path)
         self.taint_jsonl_path = pathlib.Path(taint_jsonl_path) if taint_jsonl_path else None
+        self.labels_jsonl_path = pathlib.Path(labels_jsonl_path) if labels_jsonl_path else None
         self.max_nodes = max_nodes
         self.cache_embeddings = cache_embeddings
         
@@ -50,6 +53,9 @@ class CPGGraphDataset(Dataset):
         
         # Load taint records if provided
         self.taint_records = self._load_taint_records() if taint_jsonl_path else []
+        
+        # Load labels if provided
+        self.labels = self._load_labels() if labels_jsonl_path else None
         
         # Cache for embeddings
         self._embedding_cache = {} if cache_embeddings else None
@@ -73,6 +79,21 @@ class CPGGraphDataset(Dataset):
         """Load taint records from JSONL file."""
         from ir.io import iter_taint_records
         return list(iter_taint_records(str(self.taint_jsonl_path)))
+    
+    def _load_labels(self) -> List[Dict[str, Any]]:
+        """Load labels from JSONL file."""
+        labels = []
+        with open(self.labels_jsonl_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    label_data = json.loads(line)
+                    labels.append(label_data)
+                except json.JSONDecodeError:
+                    continue
+        return labels
     
     def _get_node_embeddings(self, nodes: List[Dict[str, Any]]) -> np.ndarray:
         """Get embeddings for nodes, using cache if available."""
@@ -182,17 +203,25 @@ class CPGGraphDataset(Dataset):
     
     def __getitem__(self, idx: int) -> Tuple[Data, Optional[Dict[str, Any]]]:
         """
-        Get a graph and its associated taint records.
+        Get a graph and its associated label or taint records.
         
         Returns:
-            Tuple of (graph_data, taint_info)
+            Tuple of (graph_data, label_info)
             - graph_data: PyG Data object
-            - taint_info: Dict with source/sink node IDs if available, None otherwise
+            - label_info: Dict with label and metadata if available, or taint_info if using taint records
         """
         graph_dict = self.graphs[idx]
         graph_data = self._graph_to_pyg(graph_dict)
         
-        # Find matching taint records for this graph
+        # Priority 1: Use labels if available (supervised learning)
+        if self.labels is not None and idx < len(self.labels):
+            label_data = self.labels[idx]
+            return graph_data, {
+                "label": label_data.get("label", 0),
+                "metadata": label_data.get("metadata", {})
+            }
+        
+        # Priority 2: Use taint records (semi-supervised or taint flow prediction)
         taint_info = None
         if self.taint_records:
             file_path = graph_dict.get("file", "")
