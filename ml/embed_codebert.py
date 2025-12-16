@@ -63,13 +63,14 @@ class CodeBERTEmbedder:
         
         return embedding.astype(np.float32)
     
-    def embed_batch(self, codes: List[str], max_length: int = 512) -> np.ndarray:
+    def embed_batch(self, codes: List[str], max_length: int = 512, chunk_size: int = 32) -> np.ndarray:
         """
         Embed a batch of code snippets.
         
         Args:
             codes: List of code snippet strings
             max_length: Maximum sequence length
+            chunk_size: Process in chunks to avoid OOM (default: 32)
             
         Returns:
             Array of embeddings (batch_size, 768)
@@ -80,35 +81,49 @@ class CodeBERTEmbedder:
         # Handle empty codes
         processed_codes = [c if c and c.strip() else "" for c in codes]
         
-        # Tokenize batch
-        inputs = self.tokenizer(
-            processed_codes,
-            return_tensors="pt",
-            max_length=max_length,
-            truncation=True,
-            padding=True
-        )
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        # Process in chunks to avoid OOM
+        all_embeddings = []
+        for i in range(0, len(processed_codes), chunk_size):
+            chunk_codes = processed_codes[i:i + chunk_size]
+            
+            # Tokenize batch
+            inputs = self.tokenizer(
+                chunk_codes,
+                return_tensors="pt",
+                max_length=max_length,
+                truncation=True,
+                padding=True
+            )
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+            
+            # Get embeddings
+            with torch.no_grad():
+                outputs = self.model(**inputs)
+                # Use [CLS] token embedding (first token)
+                chunk_embeddings = outputs.last_hidden_state[:, 0, :].cpu().numpy()
+            
+            all_embeddings.append(chunk_embeddings)
+            
+            # Clear GPU cache after each chunk
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         
-        # Get embeddings
-        with torch.no_grad():
-            outputs = self.model(**inputs)
-            # Use [CLS] token embedding (first token)
-            embeddings = outputs.last_hidden_state[:, 0, :].cpu().numpy()
-        
+        # Concatenate all chunks
+        embeddings = np.concatenate(all_embeddings, axis=0)
         return embeddings.astype(np.float32)
     
-    def embed_nodes(self, nodes: List[Dict[str, Any]], max_length: int = 512) -> np.ndarray:
+    def embed_nodes(self, nodes: List[Dict[str, Any]], max_length: int = 512, chunk_size: int = 32) -> np.ndarray:
         """
         Embed CPG nodes by extracting code from each node.
         
         Args:
             nodes: List of CPG node dictionaries with 'code' field
             max_length: Maximum sequence length
+            chunk_size: Process in chunks to avoid OOM (default: 32)
             
         Returns:
             Array of embeddings (num_nodes, 768)
         """
         codes = [node.get("code") or "" for node in nodes]
-        return self.embed_batch(codes, max_length=max_length)
+        return self.embed_batch(codes, max_length=max_length, chunk_size=chunk_size)
 

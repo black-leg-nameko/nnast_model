@@ -63,6 +63,7 @@ class CPGGraphDataset(Dataset):
     def _load_graphs(self) -> List[Dict[str, Any]]:
         """Load CPG graphs from JSONL file."""
         graphs = []
+        skipped_large = 0
         with open(self.graph_jsonl_path, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
@@ -70,9 +71,16 @@ class CPGGraphDataset(Dataset):
                     continue
                 try:
                     graph_dict = json.loads(line)
+                    # Skip graphs that are too large (to avoid OOM)
+                    num_nodes = len(graph_dict.get("nodes", []))
+                    if num_nodes > self.max_nodes * 2:  # Skip if more than 2x max_nodes
+                        skipped_large += 1
+                        continue
                     graphs.append(graph_dict)
                 except json.JSONDecodeError:
                     continue
+        if skipped_large > 0:
+            print(f"⚠️ {skipped_large}個の大きすぎるグラフをスキップしました（>{self.max_nodes * 2}ノード）")
         return graphs
     
     def _load_taint_records(self) -> List[Dict[str, Any]]:
