@@ -1,0 +1,21 @@
+{
+  "train_data": "tmp_sample/graphs.jsonl",
+  "val_data": null,
+  "output_dir": "./checkpoints_test",
+  "epochs": 2,
+  "batch_size": 1,
+  "lr": 0.0001,
+  "hidden_dim": 128,
+  "num_layers": 2,
+  "num_heads": 8,
+  "dropout": 0.1,
+  "pool_type": "mean",
+  "gnn_type": "gat",
+  "codebert_model": "microsoft/codebert-base",
+  "max_nodes": 100,
+  "max_code_length": 512,
+  "model_type": "embedding",
+  "num_classes": 2,
+  "device": null,
+  "save_every": 1
+}

@@ -1,0 +1,61 @@
+Collecting Python vulnerabilities from GitHub...
+Query: CVE-2023, Language: python, Limit: 30
+Searching GitHub commits: CVE-2023 (language: python, limit: 30)
+Found 2 commits
+
+Processing commit 40fd37ee from HenriquesLab/rxiv-maker...
+  Processing file: EXAMPLE_MANUSCRIPT/FIGURES/SFigure__arxiv_growth.py
+  Processing file: noxfile.py
+  Processing file: scripts/categorize_tests.py
+  Processing file: scripts/check_performance_regression.py
+  Processing file: scripts/maintainer/fetch-package-sha256.py
+Not found: /repos/HenriquesLab/rxiv-maker/contents/scripts/maintainer/fetch-package-sha256.py
+    Warning: Could not get file content before fix
+  Processing file: scripts/maintainer/orchestrate-release.py
+Not found: /repos/HenriquesLab/rxiv-maker/contents/scripts/maintainer/orchestrate-release.py
+    Warning: Could not get file content before fix
+  Processing file: scripts/maintainer/update-package-templates.py
+Not found: /repos/HenriquesLab/rxiv-maker/contents/scripts/maintainer/update-package-templates.py
+    Warning: Could not get file content before fix
+  Processing file: scripts/maintainer/validate-package-templates.py
+Not found: /repos/HenriquesLab/rxiv-maker/contents/scripts/maintainer/validate-package-templates.py
+    Warning: Could not get file content before fix
+  Processing file: scripts/run_performance_demo.py
+  Processing file: scripts/safeguards/check-repo-boundaries.py
+Not found: /repos/HenriquesLab/rxiv-maker/contents/scripts/safeguards/check-repo-boundaries.py
+    Warning: Could not get file content before fix
+  Processing file: scripts/test-package-system.py
+  Processing file: src/rxiv_maker/__version__.py
+  Processing file: src/rxiv_maker/cli/commands/arxiv.py
+  Processing file: src/rxiv_maker/cli/commands/bibliography.py
+  Processing file: src/rxiv_maker/cli/commands/build.py
+  Processing file: src/rxiv_maker/cli/commands/check_installation.py
+  Processing file: src/rxiv_maker/cli/commands/clean.py
+  Processing file: src/rxiv_maker/cli/commands/figures.py
+  Processing file: src/rxiv_maker/cli/commands/init.py
+  Processing file: src/rxiv_maker/cli/commands/install_deps.py
+  Processing file: src/rxiv_maker/cli/commands/setup.py
+  Processing file: src/rxiv_maker/cli/commands/track_changes.py
+  Processing file: src/rxiv_maker/cli/commands/validate.py
+  Processing file: src/rxiv_maker/cli/commands/version.py
+  Processing file: src/rxiv_maker/cli/main.py
+  Processing file: src/rxiv_maker/converters/citation_processor.py
+  Processing file: src/rxiv_maker/converters/code_processor.py
+  Processing file: src/rxiv_maker/converters/figure_processor.py
+  Processing file: src/rxiv_maker/converters/html_processor.py
+  Processing file: src/rxiv_maker/converters/list_processor.py
+  Processing file: src/rxiv_maker/converters/math_processor.py
+  Processing file: src/rxiv_maker/converters/md2tex.py
+  Processing file: src/rxiv_maker/converters/section_processor.py
+  Processing file: src/rxiv_maker/converters/supplementary_note_processor.py
+  Processing file: src/rxiv_maker/converters/table_processor.py
+
+Collected 30 vulnerability records
+
+============================================================
+Collection complete!
+Total records collected: 30
+Dataset saved to: dataset
+  - Metadata: dataset/metadata.jsonl
+  - CPG graphs: dataset/processed
+============================================================

@@ -37,3 +37,18 @@ htmlcov/
 tmp/
 tmp_*/
 tmp_sample/*
+
+# Model checkpoints (large binary files)
+checkpoints*/
+*.pt
+*.pth
+*.ckpt
+
+# Dataset files (large, regenerable data)
+dataset/
+dataset_*/
+training_data/
+training_data_*/
+# Keep dataset structure documentation
+!dataset/README.md
+!dataset/README*.md

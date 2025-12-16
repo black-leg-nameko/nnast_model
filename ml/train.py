@@ -1,0 +1,362 @@
+#!/usr/bin/env python3
+"""
+Training script for CPG taint flow prediction model.
+"""
+import argparse
+import json
+import pathlib
+from typing import Optional, Dict, Any
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, random_split
+from torch_geometric.data import Batch
+import torch.optim as optim
+from tqdm import tqdm
+
+from ml.model import CPGTaintFlowModel, CPGNodePairModel
+from ml.dataset import CPGGraphDataset
+from ml.embed_codebert import CodeBERTEmbedder
+
+
+def collate_fn(batch):
+    """Custom collate function for batching graphs and taint info."""
+    graphs, taint_infos = zip(*batch)
+    
+    # Batch graphs using PyG's Batch
+    batched_graphs = Batch.from_data_list(graphs)
+    
+    # Collect taint info
+    batched_taint_info = list(taint_infos)
+    
+    return batched_graphs, batched_taint_info
+
+
+def train_epoch(
+    model: nn.Module,
+    dataloader: DataLoader,
+    optimizer: optim.Optimizer,
+    criterion: nn.Module,
+    device: torch.device,
+    epoch: int,
+) -> Dict[str, float]:
+    """Train for one epoch."""
+    model.train()
+    total_loss = 0.0
+    correct = 0
+    total = 0
+    
+    pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
+    for batch_graphs, batch_info in pbar:
+        batch_graphs = batch_graphs.to(device)
+        
+        # Extract labels from batch_info
+        # Priority: explicit label > taint info > default (0)
+        labels_list = []
+        for info in batch_info:
+            if info is None:
+                labels_list.append(0)
+            elif "label" in info:
+                # Explicit label from labels JSONL
+                labels_list.append(info["label"])
+            else:
+                # Taint info available (label as 1)
+                labels_list.append(1)
+        
+        labels = torch.tensor(labels_list, dtype=torch.long, device=device)
+        
+        # Forward pass
+        optimizer.zero_grad()
+        logits = model(batch_graphs)
+        loss = criterion(logits, labels)
+        
+        # Backward pass
+        loss.backward()
+        optimizer.step()
+        
+        # Statistics
+        total_loss += loss.item()
+        pred = logits.argmax(dim=1)
+        correct += (pred == labels).sum().item()
+        total += labels.size(0)
+        
+        pbar.set_postfix({
+            "loss": f"{loss.item():.4f}",
+            "acc": f"{100 * correct / total:.2f}%"
+        })
+    
+    avg_loss = total_loss / len(dataloader)
+    accuracy = 100 * correct / total if total > 0 else 0.0
+    
+    return {
+        "loss": avg_loss,
+        "accuracy": accuracy
+    }
+
+
+def evaluate(
+    model: nn.Module,
+    dataloader: DataLoader,
+    criterion: nn.Module,
+    device: torch.device,
+) -> Dict[str, float]:
+    """Evaluate model."""
+    model.eval()
+    total_loss = 0.0
+    correct = 0
+    total = 0
+    
+    with torch.no_grad():
+        for batch_graphs, batch_info in tqdm(dataloader, desc="Evaluating"):
+            batch_graphs = batch_graphs.to(device)
+            
+            # Extract labels from batch_info
+            labels_list = []
+            for info in batch_info:
+                if info is None:
+                    labels_list.append(0)
+                elif "label" in info:
+                    labels_list.append(info["label"])
+                else:
+                    labels_list.append(1)
+            
+            labels = torch.tensor(labels_list, dtype=torch.long, device=device)
+            
+            logits = model(batch_graphs)
+            loss = criterion(logits, labels)
+            
+            total_loss += loss.item()
+            pred = logits.argmax(dim=1)
+            correct += (pred == labels).sum().item()
+            total += labels.size(0)
+    
+    avg_loss = total_loss / len(dataloader)
+    accuracy = 100 * correct / total if total > 0 else 0.0
+    
+    return {
+        "loss": avg_loss,
+        "accuracy": accuracy
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Train CPG taint flow prediction model"
+    )
+    parser.add_argument(
+        "--graphs",
+        required=True,
+        help="Path to CPG graphs JSONL file"
+    )
+    parser.add_argument(
+        "--taint-log",
+        help="Path to taint records JSONL file (optional)"
+    )
+    parser.add_argument(
+        "--labels",
+        help="Path to labels JSONL file (for supervised learning)"
+    )
+    parser.add_argument(
+        "--output-dir",
+        default="./checkpoints",
+        help="Output directory for checkpoints"
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=8,
+        help="Batch size"
+    )
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=10,
+        help="Number of training epochs"
+    )
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=1e-4,
+        help="Learning rate"
+    )
+    parser.add_argument(
+        "--hidden-dim",
+        type=int,
+        default=256,
+        help="Hidden dimension"
+    )
+    parser.add_argument(
+        "--num-layers",
+        type=int,
+        default=3,
+        help="Number of GNN layers"
+    )
+    parser.add_argument(
+        "--gnn-type",
+        choices=["GCN", "GAT"],
+        default="GCN",
+        help="GNN type"
+    )
+    parser.add_argument(
+        "--max-nodes",
+        type=int,
+        default=1000,
+        help="Maximum number of nodes per graph"
+    )
+    parser.add_argument(
+        "--train-ratio",
+        type=float,
+        default=0.8,
+        help="Train/validation split ratio"
+    )
+    parser.add_argument(
+        "--device",
+        help="Device to use (cuda/cpu, auto-detect if not specified)"
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed"
+    )
+    
+    args = parser.parse_args()
+    
+    # Set random seed
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+    
+    # Device
+    device = torch.device(
+        args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    )
+    print(f"Using device: {device}")
+    
+    # Create output directory
+    output_dir = pathlib.Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Initialize embedder
+    print("Initializing CodeBERT embedder...")
+    embedder = CodeBERTEmbedder(device=str(device))
+    
+    # Load dataset
+    print(f"Loading dataset from {args.graphs}...")
+    dataset = CPGGraphDataset(
+        graph_jsonl_path=args.graphs,
+        taint_jsonl_path=args.taint_log,
+        labels_jsonl_path=args.labels,
+        embedder=embedder,
+        max_nodes=args.max_nodes,
+    )
+    
+    print(f"Loaded {len(dataset)} graphs")
+    
+    # Split dataset
+    train_size = int(args.train_ratio * len(dataset))
+    val_size = len(dataset) - train_size
+    train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
+    
+    print(f"Train: {len(train_dataset)}, Val: {len(val_dataset)}")
+    
+    # Create data loaders
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        collate_fn=collate_fn,
+        num_workers=0,  # Set to 0 to avoid multiprocessing issues
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        collate_fn=collate_fn,
+        num_workers=0,
+    )
+    
+    # Initialize model
+    print("Initializing model...")
+    model = CPGTaintFlowModel(
+        input_dim=768,
+        hidden_dim=args.hidden_dim,
+        num_layers=args.num_layers,
+        num_classes=2,
+        gnn_type=args.gnn_type,
+        dropout=0.5,
+    ).to(device)
+    
+    print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+    
+    # Loss and optimizer
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    
+    # Training loop
+    best_val_acc = 0.0
+    history = {
+        "train_loss": [],
+        "train_acc": [],
+        "val_loss": [],
+        "val_acc": [],
+    }
+    
+    print("\nStarting training...")
+    for epoch in range(1, args.epochs + 1):
+        # Train
+        train_metrics = train_epoch(
+            model, train_loader, optimizer, criterion, device, epoch
+        )
+        
+        # Validate
+        val_metrics = evaluate(model, val_loader, criterion, device)
+        
+        # Log
+        print(
+            f"Epoch {epoch}/{args.epochs}: "
+            f"Train Loss: {train_metrics['loss']:.4f}, "
+            f"Train Acc: {train_metrics['accuracy']:.2f}%, "
+            f"Val Loss: {val_metrics['loss']:.4f}, "
+            f"Val Acc: {val_metrics['accuracy']:.2f}%"
+        )
+        
+        # Save history
+        history["train_loss"].append(train_metrics["loss"])
+        history["train_acc"].append(train_metrics["accuracy"])
+        history["val_loss"].append(val_metrics["loss"])
+        history["val_acc"].append(val_metrics["accuracy"])
+        
+        # Save checkpoint
+        checkpoint = {
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "train_metrics": train_metrics,
+            "val_metrics": val_metrics,
+            "args": vars(args),
+        }
+        
+        checkpoint_path = output_dir / f"checkpoint_epoch_{epoch}.pt"
+        torch.save(checkpoint, checkpoint_path)
+        
+        # Save best model
+        if val_metrics["accuracy"] > best_val_acc:
+            best_val_acc = val_metrics["accuracy"]
+            best_path = output_dir / "best_model.pt"
+            torch.save(checkpoint, best_path)
+            print(f"Saved best model (val_acc: {best_val_acc:.2f}%)")
+    
+    # Save training history
+    history_path = output_dir / "training_history.json"
+    with open(history_path, "w") as f:
+        json.dump(history, f, indent=2)
+    
+    print(f"\nTraining completed! Best validation accuracy: {best_val_acc:.2f}%")
+    print(f"Checkpoints saved to: {output_dir}")
+
+
+if __name__ == "__main__":
+    main()
+
