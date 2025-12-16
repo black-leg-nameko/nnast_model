@@ -55,6 +55,28 @@ class TrainingDataPreparer:
         
         return records
     
+    def load_safe_files_metadata(self) -> List[Dict]:
+        """Load safe files metadata."""
+        metadata_file = self.dataset_dir / "metadata_safe.jsonl"
+        if not metadata_file.exists():
+            print(f"Info: Safe files metadata not found: {metadata_file}")
+            print("  Run 'python -m data.collect_safe_files' to collect safe files")
+            return []
+        
+        records = []
+        with open(metadata_file, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                    records.append(record)
+                except json.JSONDecodeError:
+                    continue
+        
+        return records
+    
     def load_cpg_graphs(self, record: Dict, version: str) -> Optional[Dict]:
         """
         Load CPG graph for a specific version.
@@ -118,17 +140,72 @@ class TrainingDataPreparer:
         # For now, return None
         return None
     
-    def create_training_samples(self, records: List[Dict]) -> List[Dict]:
+    def load_safe_file_graph(self, record: Dict) -> Optional[Dict]:
+        """Load CPG graph for a safe file."""
+        # Check if graph file is specified in record
+        if "graph_file" in record:
+            graph_file = self.dataset_dir / record["graph_file"]
+            if graph_file.exists():
+                with open(graph_file, "r") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            try:
+                                return json.loads(line)
+                            except json.JSONDecodeError:
+                                continue
+        
+        # Try to generate from code
+        if "code" in record:
+            return self._generate_cpg_from_code(record["code"])
+        
+        return None
+    
+    def _generate_cpg_from_code(self, code: str) -> Optional[Dict]:
+        """Generate CPG graph from code string."""
+        import subprocess
+        import sys
+        import tempfile
+        
+        try:
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as tmp_file:
+                tmp_file.write(code)
+                tmp_file_path = tmp_file.name
+            
+            result = subprocess.run(
+                [sys.executable, "-m", "cli", tmp_file_path, "--out", "/dev/stdout"],
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+            
+            pathlib.Path(tmp_file_path).unlink()
+            
+            if result.returncode == 0:
+                lines = result.stdout.strip().split('\n')
+                if lines:
+                    return json.loads(lines[0])
+        except Exception as e:
+            print(f"  Warning: Failed to generate CPG from code: {e}")
+        
+        return None
+    
+    def create_training_samples(self, records: List[Dict], safe_records: List[Dict] = None) -> List[Dict]:
         """
-        Create training samples from vulnerability records.
+        Create training samples from vulnerability records and safe files.
         
         Each sample contains:
         - graph: CPG graph
-        - label: 1 for vulnerable, 0 for fixed
+        - label: 1 for vulnerable, 0 for safe (fixed or originally safe)
         - metadata: CVE ID, CWE ID, vulnerability type, etc.
+        
+        Args:
+            records: Vulnerability records (before/after pairs)
+            safe_records: Safe file records (originally safe files)
         """
         samples = []
         
+        # Process vulnerability records
         for record in records:
             # Load vulnerable code graph (label: 1)
             graph_before = self.load_cpg_graphs(record, "before")
@@ -143,6 +220,7 @@ class TrainingDataPreparer:
                         "repo_url": record.get("repo_url"),
                         "commit": record.get("commit_before"),
                         "file_path": record.get("file_path"),
+                        "sample_type": "vulnerable",
                     }
                 })
             
@@ -151,7 +229,7 @@ class TrainingDataPreparer:
             if graph_after:
                 samples.append({
                     "graph": graph_after,
-                    "label": 0,  # Fixed (non-vulnerable)
+                    "label": 0,  # Safe (fixed)
                     "metadata": {
                         "cve_id": record.get("cve_id"),
                         "cwe_id": record.get("cwe_id"),
@@ -159,8 +237,29 @@ class TrainingDataPreparer:
                         "repo_url": record.get("repo_url"),
                         "commit": record.get("commit_after"),
                         "file_path": record.get("file_path"),
+                        "sample_type": "fixed",
                     }
                 })
+        
+        # Process safe files (originally safe, not fixed)
+        if safe_records:
+            print(f"Processing {len(safe_records)} safe files...")
+            for record in safe_records:
+                graph = self.load_safe_file_graph(record)
+                if graph:
+                    samples.append({
+                        "graph": graph,
+                        "label": 0,  # Safe (originally safe)
+                        "metadata": {
+                            "cve_id": None,
+                            "cwe_id": None,
+                            "vulnerability_type": "none",
+                            "repo_url": record.get("repo_url"),
+                            "commit": record.get("commit", "HEAD"),
+                            "file_path": record.get("file_path"),
+                            "sample_type": "originally_safe",
+                        }
+                    })
         
         return samples
     
@@ -185,6 +284,74 @@ class TrainingDataPreparer:
         test_samples = samples[train_size + val_size:]
         
         return train_samples, val_samples, test_samples
+    
+    def _balance_dataset(self, samples: List[Dict], safe_ratio: float = 0.3) -> List[Dict]:
+        """
+        Balance dataset to have target ratio of safe files.
+        
+        Args:
+            samples: All training samples
+            safe_ratio: Target ratio of safe files (originally_safe) to total
+            
+        Returns:
+            Balanced samples list
+        """
+        # Separate samples by type
+        vulnerable_samples = [s for s in samples if s["label"] == 1]
+        safe_samples = [s for s in samples if s["label"] == 0]
+        originally_safe = [s for s in safe_samples if s["metadata"].get("sample_type") == "originally_safe"]
+        fixed_samples = [s for s in safe_samples if s["metadata"].get("sample_type") == "fixed"]
+        
+        print(f"  Vulnerable: {len(vulnerable_samples)}")
+        print(f"  Fixed: {len(fixed_samples)}")
+        print(f"  Originally safe: {len(originally_safe)}")
+        
+        # If no originally safe samples, return as is
+        if len(originally_safe) == 0:
+            print("  No originally safe samples to balance")
+            balanced_samples = vulnerable_samples + fixed_samples
+            random.shuffle(balanced_samples)
+            return balanced_samples
+        
+        # Calculate target number of originally safe samples
+        # We want: originally_safe / total ≈ safe_ratio
+        # So: originally_safe ≈ safe_ratio * (vulnerable + fixed + originally_safe)
+        # Solving: originally_safe ≈ safe_ratio * (vulnerable + fixed) / (1 - safe_ratio)
+        other_samples_count = len(vulnerable_samples) + len(fixed_samples)
+        
+        if other_samples_count == 0:
+            # Only safe samples, return as is
+            balanced_samples = originally_safe
+            random.shuffle(balanced_samples)
+            return balanced_samples
+        
+        target_safe = max(1, int(safe_ratio * other_samples_count / (1 - safe_ratio)))
+        
+        # Sample or duplicate originally safe files to reach target
+        if len(originally_safe) < target_safe:
+            # Duplicate some samples
+            needed = target_safe - len(originally_safe)
+            if len(originally_safe) > 0:
+                duplicated = random.choices(originally_safe, k=needed)
+                originally_safe.extend(duplicated)
+                print(f"  Duplicated {needed} safe samples to reach target ratio")
+            else:
+                print(f"  Warning: Cannot duplicate, no originally safe samples available")
+        elif len(originally_safe) > target_safe:
+            # Sample down, but keep at least 1 if we have any
+            if target_safe > 0:
+                originally_safe = random.sample(originally_safe, target_safe)
+                print(f"  Sampled down to {target_safe} safe samples")
+            else:
+                # Keep at least 1 if we have any
+                originally_safe = [originally_safe[0]] if originally_safe else []
+                print(f"  Kept 1 safe sample (target was 0)")
+        
+        # Combine all samples
+        balanced_samples = vulnerable_samples + fixed_samples + originally_safe
+        random.shuffle(balanced_samples)
+        
+        return balanced_samples
     
     def save_dataset(self, samples: List[Dict], graphs_file: pathlib.Path, labels_file: pathlib.Path):
         """Save dataset to JSONL files."""
@@ -239,15 +406,42 @@ class TrainingDataPreparer:
         
         return stats
     
-    def prepare(self, train_ratio: float = 0.7, val_ratio: float = 0.15, test_ratio: float = 0.15):
-        """Prepare training data from dataset."""
+    def prepare(
+        self,
+        train_ratio: float = 0.7,
+        val_ratio: float = 0.15,
+        test_ratio: float = 0.15,
+        include_safe_files: bool = True,
+        safe_file_ratio: float = 0.3,  # Ratio of safe files to total samples
+    ):
+        """
+        Prepare training data from dataset.
+        
+        Args:
+            train_ratio: Training set ratio
+            val_ratio: Validation set ratio
+            test_ratio: Test set ratio
+            include_safe_files: Whether to include safe files in dataset
+            safe_file_ratio: Target ratio of safe files (originally safe) to total samples
+        """
         print("Loading metadata...")
         records = self.load_metadata()
         print(f"Loaded {len(records)} vulnerability records")
         
+        # Load safe files if requested
+        safe_records = []
+        if include_safe_files:
+            safe_records = self.load_safe_files_metadata()
+            print(f"Loaded {len(safe_records)} safe file records")
+        
         print("Creating training samples...")
-        samples = self.create_training_samples(records)
+        samples = self.create_training_samples(records, safe_records)
         print(f"Created {len(samples)} training samples")
+        
+        # Balance dataset if needed
+        if include_safe_files and safe_records:
+            samples = self._balance_dataset(samples, safe_file_ratio)
+            print(f"After balancing: {len(samples)} training samples")
         
         print("Splitting dataset...")
         train_samples, val_samples, test_samples = self.split_dataset(
@@ -277,7 +471,7 @@ class TrainingDataPreparer:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Prepare training data from vulnerability dataset"
+        description="Prepare training data from vulnerability dataset and safe files"
     )
     parser.add_argument(
         "--dataset-dir",
@@ -307,6 +501,17 @@ def main():
         default=0.15,
         help="Test set ratio"
     )
+    parser.add_argument(
+        "--no-safe-files",
+        action="store_true",
+        help="Exclude safe files from dataset (use only vulnerable/fixed pairs)"
+    )
+    parser.add_argument(
+        "--safe-file-ratio",
+        type=float,
+        default=0.3,
+        help="Target ratio of originally safe files to total samples (default: 0.3)"
+    )
     
     args = parser.parse_args()
     
@@ -314,7 +519,13 @@ def main():
     output_dir = pathlib.Path(args.output_dir)
     
     preparer = TrainingDataPreparer(dataset_dir, output_dir)
-    preparer.prepare(args.train_ratio, args.val_ratio, args.test_ratio)
+    preparer.prepare(
+        args.train_ratio,
+        args.val_ratio,
+        args.test_ratio,
+        include_safe_files=not args.no_safe_files,
+        safe_file_ratio=args.safe_file_ratio,
+    )
 
 
 if __name__ == "__main__":

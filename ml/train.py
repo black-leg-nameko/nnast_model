@@ -17,6 +17,7 @@ from tqdm import tqdm
 from ml.model import CPGTaintFlowModel, CPGNodePairModel
 from ml.dataset import CPGGraphDataset
 from ml.embed_codebert import CodeBERTEmbedder
+from sklearn.metrics import f1_score, precision_score, recall_score
 
 
 def collate_fn(batch):
@@ -105,6 +106,8 @@ def evaluate(
     total_loss = 0.0
     correct = 0
     total = 0
+    all_preds = []
+    all_labels = []
     
     with torch.no_grad():
         for batch_graphs, batch_info in tqdm(dataloader, desc="Evaluating"):
@@ -129,13 +132,30 @@ def evaluate(
             pred = logits.argmax(dim=1)
             correct += (pred == labels).sum().item()
             total += labels.size(0)
+            
+            # Collect predictions and labels for metrics
+            all_preds.extend(pred.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
     
     avg_loss = total_loss / len(dataloader)
     accuracy = 100 * correct / total if total > 0 else 0.0
     
+    # Calculate additional metrics
+    if len(set(all_labels)) > 1:  # Only if we have both classes
+        f1 = f1_score(all_labels, all_preds, average='binary')
+        precision = precision_score(all_labels, all_preds, average='binary', zero_division=0)
+        recall = recall_score(all_labels, all_preds, average='binary', zero_division=0)
+    else:
+        f1 = 0.0
+        precision = 0.0
+        recall = 0.0
+    
     return {
         "loss": avg_loss,
-        "accuracy": accuracy
+        "accuracy": accuracy,
+        "f1": f1,
+        "precision": precision,
+        "recall": recall
     }
 
 
@@ -254,12 +274,55 @@ def main():
     
     print(f"Loaded {len(dataset)} graphs")
     
+    # Check label distribution before splitting
+    if args.labels:
+        print("\nChecking label distribution in dataset...")
+        label_counts = {0: 0, 1: 0}
+        for i in range(min(100, len(dataset))):  # Check first 100 samples
+            try:
+                _, label_info = dataset[i]
+                if label_info and "label" in label_info:
+                    label = int(label_info["label"])
+                    label_counts[label] += 1
+            except:
+                pass
+        print(f"Label distribution (first 100 samples): {label_counts}")
+        if label_counts[0] == 0 or label_counts[1] == 0:
+            print("⚠️ WARNING: Only one class found in labels! Check your label file.")
+    
     # Split dataset
     train_size = int(args.train_ratio * len(dataset))
     val_size = len(dataset) - train_size
     train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
     
     print(f"Train: {len(train_dataset)}, Val: {len(val_dataset)}")
+    
+    # Check label distribution after splitting
+    if args.labels:
+        print("\nChecking label distribution in train/val splits...")
+        train_label_counts = {0: 0, 1: 0}
+        val_label_counts = {0: 0, 1: 0}
+        
+        for i in range(min(100, len(train_dataset))):
+            try:
+                _, label_info = train_dataset[i]
+                if label_info and "label" in label_info:
+                    label = int(label_info["label"])
+                    train_label_counts[label] += 1
+            except:
+                pass
+        
+        for i in range(min(100, len(val_dataset))):
+            try:
+                _, label_info = val_dataset[i]
+                if label_info and "label" in label_info:
+                    label = int(label_info["label"])
+                    val_label_counts[label] += 1
+            except:
+                pass
+        
+        print(f"Train labels (first 100): {train_label_counts}")
+        print(f"Val labels (first 100): {val_label_counts}")
     
     # Create data loaders
     train_loader = DataLoader(
@@ -290,8 +353,44 @@ def main():
     
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
     
+    # Calculate class weights for imbalanced datasets
+    if args.labels:
+        print("Calculating class weights...")
+        label_counts = {0: 0, 1: 0}
+        with open(args.labels, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        label_data = json.loads(line)
+                        label = label_data.get("label", label_data.get("target", 0))
+                        label_counts[int(label)] += 1
+                    except:
+                        pass
+        
+        total = sum(label_counts.values())
+        if total > 0 and min(label_counts.values()) > 0:
+            # Calculate inverse frequency weights
+            weights = torch.tensor([
+                total / (2 * label_counts[0]),  # Weight for class 0
+                total / (2 * label_counts[1])   # Weight for class 1
+            ], dtype=torch.float32, device=device)
+            print(f"Class weights: {weights.cpu().numpy()}")
+            print(f"Class distribution: {label_counts}")
+        else:
+            weights = None
+            print("⚠️ Could not calculate class weights, using uniform weights")
+    else:
+        weights = None
+    
     # Loss and optimizer
-    criterion = nn.CrossEntropyLoss()
+    if weights is not None:
+        criterion = nn.CrossEntropyLoss(weight=weights)
+        print("Using weighted CrossEntropyLoss")
+    else:
+        criterion = nn.CrossEntropyLoss()
+        print("Using standard CrossEntropyLoss")
+    
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
     
     # Training loop
@@ -301,6 +400,9 @@ def main():
         "train_acc": [],
         "val_loss": [],
         "val_acc": [],
+        "val_f1": [],
+        "val_precision": [],
+        "val_recall": [],
     }
     
     print("\nStarting training...")
@@ -321,12 +423,22 @@ def main():
             f"Val Loss: {val_metrics['loss']:.4f}, "
             f"Val Acc: {val_metrics['accuracy']:.2f}%"
         )
+        if 'f1' in val_metrics:
+            print(
+                f"  Val F1: {val_metrics['f1']:.4f}, "
+                f"Precision: {val_metrics['precision']:.4f}, "
+                f"Recall: {val_metrics['recall']:.4f}"
+            )
         
         # Save history
         history["train_loss"].append(train_metrics["loss"])
         history["train_acc"].append(train_metrics["accuracy"])
         history["val_loss"].append(val_metrics["loss"])
         history["val_acc"].append(val_metrics["accuracy"])
+        if "f1" in val_metrics:
+            history["val_f1"].append(val_metrics["f1"])
+            history["val_precision"].append(val_metrics["precision"])
+            history["val_recall"].append(val_metrics["recall"])
         
         # Save checkpoint
         checkpoint = {
