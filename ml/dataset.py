@@ -258,7 +258,6 @@ class CPGGraphDataset(Dataset):
                 
                 # Map positions to node IDs
                 from ir.taint_merge import map_taint_record
-                from ir.schema import CPGGraph, CPGNode, CPGEdge
                 
                 # Reconstruct CPGGraph object
                 cpg_nodes = [CPGNode(**n) for n in graph_dict["nodes"]]

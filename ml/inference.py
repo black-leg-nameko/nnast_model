@@ -21,7 +21,6 @@ from ml.model import CPGTaintFlowModel
 from ml.dataset import CPGGraphDataset
 from ml.embed_codebert import CodeBERTEmbedder
 from data.github_api import load_env_file
-from torch_geometric.data import Batch
 import subprocess
 import tempfile
 
@@ -324,7 +323,6 @@ def main():
         print(f"Found {len(python_files)} Python files")
         
         # Generate CPG graphs and save to temporary JSONL
-        import tempfile
         with tempfile.NamedTemporaryFile(mode='w', suffix='.jsonl', delete=False) as tmp_file:
             tmp_jsonl = Path(tmp_file.name)
         
@@ -361,7 +359,6 @@ def main():
         graph["file"] = str(input_path)
         
         # Save to temporary JSONL
-        import tempfile
         with tempfile.NamedTemporaryFile(mode='w', suffix='.jsonl', delete=False) as tmp_file:
             tmp_jsonl = Path(tmp_file.name)
             tmp_file.write(json.dumps(graph, ensure_ascii=False) + "\n")
