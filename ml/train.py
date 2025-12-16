@@ -81,10 +81,21 @@ def train_epoch(
         correct += (pred == labels).sum().item()
         total += labels.size(0)
         
-        pbar.set_postfix({
-            "loss": f"{loss.item():.4f}",
-            "acc": f"{100 * correct / total:.2f}%"
-        })
+        # Debug: Check prediction distribution (first batch only)
+        if total == labels.size(0):  # First batch
+            pred_dist = Counter(pred.cpu().numpy().tolist())
+            label_dist = Counter(labels.cpu().numpy().tolist())
+            pbar.set_postfix({
+                "loss": f"{loss.item():.4f}",
+                "acc": f"{100 * correct / total:.2f}%",
+                "pred_dist": dict(pred_dist),
+                "label_dist": dict(label_dist),
+            })
+        else:
+            pbar.set_postfix({
+                "loss": f"{loss.item():.4f}",
+                "acc": f"{100 * correct / total:.2f}%"
+            })
     
     avg_loss = total_loss / len(dataloader)
     accuracy = 100 * correct / total if total > 0 else 0.0
@@ -196,7 +207,7 @@ def main():
     parser.add_argument(
         "--lr",
         type=float,
-        default=1e-4,
+        default=5e-4,  # Increased from 1e-4 for better learning
         help="Learning rate"
     )
     parser.add_argument(
@@ -349,9 +360,20 @@ def main():
         num_classes=2,
         gnn_type=args.gnn_type,
         dropout=0.5,
+        use_dynamic_attention=True,  # Enable dynamic attention fusion
     ).to(device)
     
+    # Initialize model parameters properly
+    def init_weights(m):
+        if isinstance(m, nn.Linear):
+            nn.init.xavier_uniform_(m.weight)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+    
+    model.apply(init_weights)
+    
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+    print(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
     
     # Calculate class weights for imbalanced datasets
     if args.labels:
@@ -386,12 +408,18 @@ def main():
     # Loss and optimizer
     if weights is not None:
         criterion = nn.CrossEntropyLoss(weight=weights)
-        print("Using weighted CrossEntropyLoss")
+        print(f"Using weighted CrossEntropyLoss with weights: {weights.cpu().numpy()}")
     else:
         criterion = nn.CrossEntropyLoss()
         print("Using standard CrossEntropyLoss")
     
-    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    # Use AdamW with weight decay for better generalization
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-5)
+    
+    # Learning rate scheduler
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=3, verbose=True
+    )
     
     # Training loop
     best_val_acc = 0.0
@@ -415,13 +443,18 @@ def main():
         # Validate
         val_metrics = evaluate(model, val_loader, criterion, device)
         
+        # Update learning rate
+        scheduler.step(val_metrics['loss'])
+        
         # Log
+        current_lr = optimizer.param_groups[0]['lr']
         print(
             f"Epoch {epoch}/{args.epochs}: "
             f"Train Loss: {train_metrics['loss']:.4f}, "
             f"Train Acc: {train_metrics['accuracy']:.2f}%, "
             f"Val Loss: {val_metrics['loss']:.4f}, "
-            f"Val Acc: {val_metrics['accuracy']:.2f}%"
+            f"Val Acc: {val_metrics['accuracy']:.2f}%, "
+            f"LR: {current_lr:.2e}"
         )
         if 'f1' in val_metrics:
             print(
@@ -429,6 +462,16 @@ def main():
                 f"Precision: {val_metrics['precision']:.4f}, "
                 f"Recall: {val_metrics['recall']:.4f}"
             )
+        
+        # Debug: Check if model is learning
+        if epoch == 1:
+            print(f"\n  First epoch check:")
+            print(f"    Train loss: {train_metrics['loss']:.4f}")
+            print(f"    Val loss: {val_metrics['loss']:.4f}")
+            if train_metrics['loss'] < 0.1 or val_metrics['loss'] < 0.1:
+                print(f"    ⚠️ Loss is very low - model might be overfitting or not learning properly")
+            if train_metrics['loss'] > 1.0 and val_metrics['loss'] > 1.0:
+                print(f"    ⚠️ Loss is very high - consider adjusting learning rate or model architecture")
         
         # Save history
         history["train_loss"].append(train_metrics["loss"])
@@ -445,6 +488,7 @@ def main():
             "epoch": epoch,
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
             "train_metrics": train_metrics,
             "val_metrics": val_metrics,
             "args": vars(args),
@@ -453,19 +497,65 @@ def main():
         checkpoint_path = output_dir / f"checkpoint_epoch_{epoch}.pt"
         torch.save(checkpoint, checkpoint_path)
         
-        # Save best model
-        if val_metrics["accuracy"] > best_val_acc:
-            best_val_acc = val_metrics["accuracy"]
+        # Save best model (based on F1 score if available, otherwise accuracy)
+        best_metric = val_metrics.get("f1", val_metrics["accuracy"])
+        current_best = history.get("best_val_f1", [best_val_acc])[-1] if "f1" in val_metrics and "best_val_f1" in history else best_val_acc
+        
+        if best_metric > current_best:
+            if "f1" in val_metrics:
+                if "best_val_f1" not in history:
+                    history["best_val_f1"] = []
+                history["best_val_f1"].append(best_metric)
+                best_val_acc = best_metric  # Update to use F1
+            else:
+                best_val_acc = val_metrics["accuracy"]
             best_path = output_dir / "best_model.pt"
             torch.save(checkpoint, best_path)
-            print(f"Saved best model (val_acc: {best_val_acc:.2f}%)")
+            metric_name = "F1" if "f1" in val_metrics else "accuracy"
+            print(f"Saved best model (val_{metric_name}: {best_metric:.4f})")
     
     # Save training history
     history_path = output_dir / "training_history.json"
     with open(history_path, "w") as f:
         json.dump(history, f, indent=2)
     
-    print(f"\nTraining completed! Best validation accuracy: {best_val_acc:.2f}%")
+    print(f"\nTraining completed!")
+    if "best_val_f1" in history:
+        print(f"  Best validation F1: {history['best_val_f1'][-1]:.4f}")
+    print(f"  Best validation accuracy: {best_val_acc:.2f}%")
+    
+    # Final diagnosis
+    print("\n" + "=" * 60)
+    print("Training Diagnosis")
+    print("=" * 60)
+    
+    if len(history["train_loss"]) > 1:
+        loss_improvement = history["train_loss"][0] - history["train_loss"][-1]
+        acc_improvement = history["train_acc"][-1] - history["train_acc"][0]
+        
+        print(f"Train loss change: {loss_improvement:.4f} ({'✅ Improved' if loss_improvement > 0 else '❌ Not improving'})")
+        print(f"Train accuracy change: {acc_improvement:.2f}% ({'✅ Improved' if acc_improvement > 0 else '❌ Not improving'})")
+        
+        if loss_improvement < 0.01:
+            print("\n⚠️ WARNING: Loss barely improved. Possible issues:")
+            print("   1. Learning rate too low or too high")
+            print("   2. Model capacity insufficient")
+            print("   3. Data quality issues")
+        
+        if acc_improvement < 1.0:
+            print("\n⚠️ WARNING: Accuracy barely improved. Possible issues:")
+            print("   1. Model not learning (check loss)")
+            print("   2. Class imbalance (use weighted loss)")
+            print("   3. Need more training epochs")
+    
+    if best_val_acc < 55.0:
+        print("\n⚠️ WARNING: Validation accuracy is very low (<55%)")
+        print("   This suggests the model is not learning effectively")
+        print("   Recommendations:")
+        print("   1. Check data quality with: python ml/diagnose_dataset.py")
+        print("   2. Try different learning rates")
+        print("   3. Increase model capacity (hidden_dim, num_layers)")
+        print("   4. Train for more epochs")
     print(f"Checkpoints saved to: {output_dir}")
 
 

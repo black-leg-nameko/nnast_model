@@ -294,6 +294,14 @@ class CPGTaintFlowModel(nn.Module):
         logits = self.classifier(x_pooled)
         
         return logits
+    
+    def reset_parameters(self):
+        """Reset model parameters for re-initialization."""
+        for layer in self.modules():
+            if isinstance(layer, (nn.Linear, nn.Conv1d)):
+                nn.init.xavier_uniform_(layer.weight)
+                if layer.bias is not None:
+                    nn.init.zeros_(layer.bias)
 
 
 class CPGNodePairModel(nn.Module):
