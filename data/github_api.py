@@ -261,28 +261,152 @@ class GitHubAPIClient:
         return matches[0].upper().replace("-", "-") if matches else None
     
     def _extract_vulnerability_type(self, text: str) -> Optional[str]:
-        """Extract vulnerability type from commit message."""
-        # Common vulnerability types
-        vuln_types = [
-            "SQL Injection", "XSS", "Cross-Site Scripting",
-            "Command Injection", "Code Injection",
-            "Path Traversal", "Directory Traversal",
-            "XXE", "XML External Entity",
-            "SSRF", "Server-Side Request Forgery",
-            "CSRF", "Cross-Site Request Forgery",
-            "Authentication Bypass", "Authorization Bypass",
-            "Information Disclosure", "Sensitive Data Exposure",
-            "Deserialization", "Insecure Deserialization",
-            "Buffer Overflow", "Integer Overflow",
-            "Race Condition", "Time-of-check Time-of-use",
-            "Cryptographic Weakness", "Weak Cryptography",
-            "Hardcoded Credentials", "Hardcoded Secret",
-        ]
-        
+        """Extract vulnerability type from commit message with improved detection."""
         text_lower = text.lower()
-        for vuln_type in vuln_types:
-            if vuln_type.lower() in text_lower:
-                return vuln_type
+        
+        # More comprehensive vulnerability type detection
+        # Order matters - more specific patterns first
+        
+        # SQL Injection (various patterns)
+        if any(pattern in text_lower for pattern in [
+            "sql injection", "sqli", "sql-injection", "sql_injection",
+            "sql injection vulnerability", "sql injection fix",
+            "parameterized query", "prepared statement",
+            "raw sql", "execute(sql", "query(sql"
+        ]):
+            return "SQL Injection"
+        
+        # XSS / Cross-Site Scripting
+        if any(pattern in text_lower for pattern in [
+            "xss", "cross-site scripting", "cross site scripting",
+            "xss vulnerability", "xss fix", "script injection"
+        ]):
+            return "XSS"
+        
+        # Command Injection
+        if any(pattern in text_lower for pattern in [
+            "command injection", "command-injection", "command_injection",
+            "os.system", "subprocess", "shell injection", "cmd injection",
+            "arbitrary command", "command execution"
+        ]):
+            return "Command Injection"
+        
+        # Path Traversal
+        if any(pattern in text_lower for pattern in [
+            "path traversal", "directory traversal", "path-traversal",
+            "directory-traversal", "../", "..\\", "file path",
+            "arbitrary file", "local file inclusion"
+        ]):
+            return "Path Traversal"
+        
+        # XXE
+        if any(pattern in text_lower for pattern in [
+            "xxe", "xml external entity", "xml entity",
+            "external entity injection"
+        ]):
+            return "XXE"
+        
+        # SSRF
+        if any(pattern in text_lower for pattern in [
+            "ssrf", "server-side request forgery", "server side request forgery",
+            "request forgery", "internal request"
+        ]):
+            return "SSRF"
+        
+        # CSRF
+        if any(pattern in text_lower for pattern in [
+            "csrf", "cross-site request forgery", "cross site request forgery"
+        ]):
+            return "CSRF"
+        
+        # Deserialization
+        if any(pattern in text_lower for pattern in [
+            "deserialization", "pickle", "unsafe deserialization",
+            "insecure deserialization", "yaml.load", "marshal.loads"
+        ]):
+            return "Deserialization"
+        
+        # Authentication Bypass
+        if any(pattern in text_lower for pattern in [
+            "authentication bypass", "auth bypass", "bypass authentication",
+            "unauthorized access", "auth vulnerability"
+        ]):
+            return "Authentication Bypass"
+        
+        # Authorization Bypass
+        if any(pattern in text_lower for pattern in [
+            "authorization bypass", "authorization vulnerability",
+            "privilege escalation", "access control", "permission bypass"
+        ]):
+            return "Authorization Bypass"
+        
+        # Information Disclosure
+        if any(pattern in text_lower for pattern in [
+            "information disclosure", "sensitive data exposure",
+            "data leak", "information leak", "exposed credentials"
+        ]):
+            return "Information Disclosure"
+        
+        # Cryptographic Weakness
+        if any(pattern in text_lower for pattern in [
+            "cryptographic weakness", "weak cryptography", "weak encryption",
+            "insecure random", "weak hash", "md5", "sha1", "weak crypto"
+        ]):
+            return "Cryptographic Weakness"
+        
+        # Buffer Overflow
+        if any(pattern in text_lower for pattern in [
+            "buffer overflow", "buffer-overflow", "stack overflow",
+            "heap overflow", "integer overflow"
+        ]):
+            return "Buffer Overflow"
+        
+        # Race Condition
+        if any(pattern in text_lower for pattern in [
+            "race condition", "race-condition", "time-of-check",
+            "toctou", "concurrent access"
+        ]):
+            return "Race Condition"
+        
+        # Hardcoded Credentials
+        if any(pattern in text_lower for pattern in [
+            "hardcoded", "hard-coded", "hard coded",
+            "hardcoded credentials", "hardcoded secret", "hardcoded password"
+        ]):
+            return "Hardcoded Credentials"
+        
+        # Code Injection (check before other injections to avoid false positives)
+        if any(pattern in text_lower for pattern in [
+            "code injection", "code-injection", "code_injection",
+            "code execution", "arbitrary code execution",
+            "eval vulnerability", "exec vulnerability",
+            "eval()", "exec()", "compile()",
+            "unsafe eval", "unsafe exec"
+        ]):
+            return "Code Injection"
+        
+        # DoS (Denial of Service)
+        if any(pattern in text_lower for pattern in [
+            "denial of service", "dos vulnerability", "dos attack",
+            "resource exhaustion", "infinite loop", "reDoS",
+            "regular expression denial of service"
+        ]):
+            return "DoS"
+        
+        # Security Misconfiguration
+        if any(pattern in text_lower for pattern in [
+            "security misconfiguration", "misconfiguration",
+            "insecure configuration", "weak configuration"
+        ]):
+            return "Security Misconfiguration"
+        
+        # Insecure Dependencies
+        if any(pattern in text_lower for pattern in [
+            "vulnerable dependency", "outdated dependency",
+            "dependency vulnerability", "dependency update",
+            "security update", "dependency bump"
+        ]):
+            return "Vulnerable Dependency"
         
         return None
     
