@@ -3,7 +3,7 @@
 
 OUTPUT_DIR="./dataset_synthetic"
 PROVIDER="${LLM_PROVIDER:-openai}"  # openai or anthropic
-MODEL="${LLM_MODEL:-gpt-4}"  # gpt-4, claude-3-opus, etc.
+MODEL="${LLM_MODEL:-gpt-4o}"  # gpt-4o, gpt-4-turbo, gpt-3.5-turbo, claude-3-opus, etc.
 
 echo "=========================================="
 echo "OWASP Top 10 Synthetic Data Generation"
@@ -12,17 +12,21 @@ echo "Provider: $PROVIDER"
 echo "Model: $MODEL"
 echo ""
 
-# Check API key
+# Check API key (Python script will load from .env, but we check here for early feedback)
 if [ "$PROVIDER" = "openai" ] && [ -z "$OPENAI_API_KEY" ]; then
-    echo "Error: OPENAI_API_KEY not set"
-    echo "Set it with: export OPENAI_API_KEY=your_key"
-    exit 1
+    echo "Warning: OPENAI_API_KEY not set in environment"
+    echo "The Python script will try to load it from .env file"
+    echo "If that fails, set it with: export OPENAI_API_KEY=your_key"
+    echo "Or add it to .env file: OPENAI_API_KEY=your_key"
+    echo ""
 fi
 
 if [ "$PROVIDER" = "anthropic" ] && [ -z "$ANTHROPIC_API_KEY" ]; then
-    echo "Error: ANTHROPIC_API_KEY not set"
-    echo "Set it with: export ANTHROPIC_API_KEY=your_key"
-    exit 1
+    echo "Warning: ANTHROPIC_API_KEY not set in environment"
+    echo "The Python script will try to load it from .env file"
+    echo "If that fails, set it with: export ANTHROPIC_API_KEY=your_key"
+    echo "Or add it to .env file: ANTHROPIC_API_KEY=your_key"
+    echo ""
 fi
 
 # Generate for difficult-to-collect types

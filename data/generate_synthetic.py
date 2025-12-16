@@ -9,6 +9,7 @@ import argparse
 import json
 import os
 import sys
+import pathlib
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
@@ -303,6 +304,34 @@ class SyntheticDatasetGenerator:
         return None
 
 
+def load_env_file(env_path: Optional[pathlib.Path] = None) -> None:
+    """
+    Load environment variables from .env file.
+    
+    Simple implementation without external dependencies.
+    """
+    if env_path is None:
+        # Look for .env in project root
+        project_root = pathlib.Path(__file__).parent.parent
+        env_path = project_root / ".env"
+    
+    if env_path.exists():
+        with open(env_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                # Skip comments and empty lines
+                if not line or line.startswith("#"):
+                    continue
+                # Parse KEY=VALUE format
+                if "=" in line:
+                    key, value = line.split("=", 1)
+                    key = key.strip()
+                    value = value.strip().strip('"').strip("'")
+                    # Only set if not already in environment
+                    if key and key not in os.environ:
+                        os.environ[key] = value
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Generate synthetic vulnerability code samples using LLM"
@@ -331,8 +360,8 @@ def main():
     )
     parser.add_argument(
         "--model",
-        default="gpt-4",
-        help="Model name (e.g., 'gpt-4', 'claude-3-opus')"
+        default="gpt-4o",
+        help="Model name (e.g., 'gpt-4o', 'gpt-4-turbo', 'gpt-3.5-turbo', 'claude-3-opus')"
     )
     parser.add_argument(
         "--cwe-id",
@@ -341,16 +370,21 @@ def main():
     
     args = parser.parse_args()
     
+    # Load environment variables from .env file
+    load_env_file()
+    
     # Check API key
     if args.provider == "openai":
         if not os.getenv("OPENAI_API_KEY"):
             print("Error: OPENAI_API_KEY not set")
             print("Set it with: export OPENAI_API_KEY=your_key")
+            print("Or add it to .env file: OPENAI_API_KEY=your_key")
             return 1
     elif args.provider == "anthropic":
         if not os.getenv("ANTHROPIC_API_KEY"):
             print("Error: ANTHROPIC_API_KEY not set")
             print("Set it with: export ANTHROPIC_API_KEY=your_key")
+            print("Or add it to .env file: ANTHROPIC_API_KEY=your_key")
             return 1
     
     # Initialize generator
