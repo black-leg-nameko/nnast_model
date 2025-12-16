@@ -281,6 +281,7 @@ def main():
         labels_jsonl_path=args.labels,
         embedder=embedder,
         max_nodes=args.max_nodes,
+        skip_large_graphs=False,  # Keep all graphs, truncate if needed
     )
     
     print(f"Loaded {len(dataset)} graphs")

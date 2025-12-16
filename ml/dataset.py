@@ -24,6 +24,7 @@ class CPGGraphDataset(Dataset):
         embedder: Optional[CodeBERTEmbedder] = None,
         max_nodes: int = 1000,
         cache_embeddings: bool = True,
+        skip_large_graphs: bool = False,  # Set to True to skip graphs larger than max_nodes * 2
     ):
         """
         Initialize CPG graph dataset.
@@ -35,12 +36,14 @@ class CPGGraphDataset(Dataset):
             embedder: CodeBERT embedder instance (will create if None)
             max_nodes: Maximum number of nodes per graph (for padding/truncation)
             cache_embeddings: Whether to cache embeddings in memory
+            skip_large_graphs: If True, skip graphs larger than max_nodes * 2 (default: False, keep all graphs)
         """
         self.graph_jsonl_path = pathlib.Path(graph_jsonl_path)
         self.taint_jsonl_path = pathlib.Path(taint_jsonl_path) if taint_jsonl_path else None
         self.labels_jsonl_path = pathlib.Path(labels_jsonl_path) if labels_jsonl_path else None
         self.max_nodes = max_nodes
         self.cache_embeddings = cache_embeddings
+        self.skip_large_graphs = skip_large_graphs
         
         # Initialize embedder
         if embedder is None:
@@ -71,16 +74,23 @@ class CPGGraphDataset(Dataset):
                     continue
                 try:
                     graph_dict = json.loads(line)
-                    # Skip graphs that are too large (to avoid OOM)
                     num_nodes = len(graph_dict.get("nodes", []))
-                    if num_nodes > self.max_nodes * 2:  # Skip if more than 2x max_nodes
+                    
+                    # Skip graphs that are too large only if skip_large_graphs is True
+                    if self.skip_large_graphs and num_nodes > self.max_nodes * 2:
                         skipped_large += 1
                         continue
+                    
                     graphs.append(graph_dict)
                 except json.JSONDecodeError:
                     continue
         if skipped_large > 0:
             print(f"⚠️ {skipped_large}個の大きすぎるグラフをスキップしました（>{self.max_nodes * 2}ノード）")
+        elif not self.skip_large_graphs:
+            # Count large graphs for information
+            large_count = sum(1 for g in graphs if len(g.get("nodes", [])) > self.max_nodes)
+            if large_count > 0:
+                print(f"ℹ️ {large_count}個の大きなグラフ（>{self.max_nodes}ノード）が含まれています。処理時に切り詰められます。")
         return graphs
     
     def _load_taint_records(self) -> List[Dict[str, Any]]:
@@ -132,12 +142,15 @@ class CPGGraphDataset(Dataset):
         nodes = graph_dict.get("nodes", [])
         edges = graph_dict.get("edges", [])
         
-        # Limit nodes if needed
+        # Limit nodes if needed (truncate to max_nodes, but keep the graph)
+        original_num_nodes = len(nodes)
         if len(nodes) > self.max_nodes:
             nodes = nodes[:self.max_nodes]
             # Filter edges to only include nodes within range
             node_ids = {n["id"] for n in nodes}
             edges = [e for e in edges if e["src"] in node_ids and e["dst"] in node_ids]
+            # Note: Graph is truncated but not skipped - this allows learning from large graphs
+            # even if we can only process a portion of them
         
         num_nodes = len(nodes)
         
