@@ -10,11 +10,40 @@ import os
 import time
 import json
 import re
+import pathlib
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 from datetime import datetime
 import requests
 from urllib.parse import quote
+
+
+def load_env_file(env_path: Optional[pathlib.Path] = None) -> None:
+    """
+    Load environment variables from .env file.
+    
+    Simple implementation without external dependencies.
+    """
+    if env_path is None:
+        # Look for .env in project root
+        project_root = pathlib.Path(__file__).parent.parent
+        env_path = project_root / ".env"
+    
+    if env_path.exists():
+        with open(env_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                # Skip comments and empty lines
+                if not line or line.startswith("#"):
+                    continue
+                # Parse KEY=VALUE format
+                if "=" in line:
+                    key, value = line.split("=", 1)
+                    key = key.strip()
+                    value = value.strip().strip('"').strip("'")
+                    # Only set if not already in environment
+                    if key and key not in os.environ:
+                        os.environ[key] = value
 
 
 @dataclass
@@ -55,6 +84,9 @@ class GitHubAPIClient:
         Args:
             token: GitHub Personal Access Token (or from GITHUB_TOKEN env var)
         """
+        # Load environment variables from .env file
+        load_env_file()
+        
         self.token = token or os.getenv("GITHUB_TOKEN")
         
         if not self.token:
@@ -502,4 +534,75 @@ class GitHubAPIClient:
             if parents:
                 return parents[0]["sha"]
         return None
+    
+    def create_issue(
+        self,
+        owner: str,
+        repo: str,
+        title: str,
+        body: str,
+        labels: Optional[List[str]] = None
+    ) -> Optional[Dict]:
+        """
+        Create a GitHub issue.
+        
+        Args:
+            owner: Repository owner
+            repo: Repository name
+            title: Issue title
+            body: Issue body (supports Markdown)
+            labels: Optional list of label names
+            
+        Returns:
+            Created issue data as dict, or None on error
+        """
+        if not self.token:
+            print("Error: GITHUB_TOKEN required to create issues")
+            return None
+        
+        endpoint = f"/repos/{owner}/{repo}/issues"
+        
+        data = {
+            "title": title,
+            "body": body
+        }
+        
+        if labels:
+            data["labels"] = labels
+        
+        self._check_rate_limit()
+        
+        url = f"{self.BASE_URL}{endpoint}"
+        
+        try:
+            response = self.session.post(url, json=data, timeout=30)
+            
+            # Update rate limit info
+            self.rate_limit_remaining = int(response.headers.get("X-RateLimit-Remaining", 5000))
+            self.rate_limit_reset = int(response.headers.get("X-RateLimit-Reset", 0))
+            
+            if response.status_code == 201:
+                return response.json()
+            elif response.status_code == 403:
+                if "rate limit" in response.text.lower():
+                    print("Rate limit exceeded. Waiting...")
+                    reset_time = self.rate_limit_reset
+                    current_time = time.time()
+                    if reset_time > current_time:
+                        wait_time = reset_time - current_time + 1
+                        time.sleep(wait_time)
+                        return self.create_issue(owner, repo, title, body, labels)
+                else:
+                    print(f"API error (403): {response.text}")
+                    return None
+            elif response.status_code == 404:
+                print(f"Repository not found: {owner}/{repo}")
+                return None
+            else:
+                print(f"API error ({response.status_code}): {response.text[:200]}")
+                return None
+                
+        except requests.exceptions.RequestException as e:
+            print(f"Request error: {e}")
+            return None
 
