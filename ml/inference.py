@@ -186,11 +186,14 @@ def run_inference(
             preds = logits.argmax(dim=1)
             confidences = probs.max(dim=1)[0]
             
-            # Get batch size
+            # Get batch size (number of graphs in this batch)
             batch_size_actual = batch_graphs.batch.max().item() + 1
             
-            # Process each item in batch
+            # Process each graph in batch
             for i in range(batch_size_actual):
+                # Mask for nodes belonging to graph i
+                graph_mask = batch_graphs.batch == i
+
                 # Get file path from graph data
                 file_path = ""
                 if hasattr(batch_graphs, "file"):
@@ -208,8 +211,47 @@ def run_inference(
                 metadata = {}
                 if batch_info and i < len(batch_info) and batch_info[i]:
                     metadata = batch_info[i].get("metadata", {})
+
+                # --- Node ID -> 行範囲(span) 情報の構築 ---
+                node_spans: List[Dict[str, Any]] = []
+                line_range: Optional[Dict[str, int]] = None
+                try:
+                    if hasattr(batch_graphs, "node_ids") and hasattr(batch_graphs, "spans"):
+                        node_ids_tensor = batch_graphs.node_ids[graph_mask]
+                        spans_tensor = batch_graphs.spans[graph_mask]
+                        if node_ids_tensor.numel() > 0 and spans_tensor.numel() > 0:
+                            spans_list = spans_tensor.tolist()
+                            node_ids_list = node_ids_tensor.tolist()
+
+                            # 個々のノードIDとspanの対応
+                            for nid, span in zip(node_ids_list, spans_list):
+                                sl, sc, el, ec = span
+                                node_spans.append(
+                                    {
+                                        "node_id": int(nid),
+                                        "span": {
+                                            "start_line": int(sl),
+                                            "start_col": int(sc),
+                                            "end_line": int(el),
+                                            "end_col": int(ec),
+                                        },
+                                    }
+                                )
+
+                            # グラフ全体の行範囲 (最小〜最大の行番号)
+                            start_lines = [s[0] for s in spans_list]
+                            end_lines = [s[2] for s in spans_list]
+                            if start_lines and end_lines:
+                                line_range = {
+                                    "start_line": int(min(start_lines)),
+                                    "end_line": int(max(end_lines)),
+                                }
+                except Exception:
+                    # span 情報の取得に失敗した場合は、location 情報を省略
+                    node_spans = []
+                    line_range = None
                 
-                result = {
+                result: Dict[str, Any] = {
                     "file_path": file_path,
                     "is_vulnerable": bool(preds[i].item() == 1),
                     "confidence": confidences[i].item(),
@@ -218,6 +260,12 @@ def run_inference(
                         "vulnerable": probs[i][1].item()
                     }
                 }
+
+                # 設計書に沿った「行範囲」情報を追加（後方互換のためオプションフィールドにする）
+                if line_range is not None:
+                    result["line_range"] = line_range
+                if node_spans:
+                    result["node_spans"] = node_spans
                 
                 # Add metadata if available
                 if metadata:

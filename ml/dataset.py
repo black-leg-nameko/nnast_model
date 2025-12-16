@@ -199,6 +199,19 @@ class CPGGraphDataset(Dataset):
             [node_kind_to_idx[k] for k in node_kinds],
             dtype=torch.long
         )
+
+        # Node span information: (start_line, start_col, end_line, end_col)
+        # This allows mapping model outputs back to concrete line ranges.
+        node_spans_list = []
+        for n in nodes:
+            span = n.get("span")
+            if isinstance(span, (list, tuple)) and len(span) == 4:
+                sl, sc, el, ec = span
+                node_spans_list.append([int(sl), int(sc), int(el), int(ec)])
+            else:
+                # Fallback: unknown span -> use zeros
+                node_spans_list.append([0, 0, 0, 0])
+        node_spans = torch.tensor(node_spans_list, dtype=torch.long) if node_spans_list else torch.empty((0, 4), dtype=torch.long)
         
         # Create PyG Data object
         # Store CodeBERT embeddings separately for dynamic attention mechanism
@@ -214,6 +227,7 @@ class CPGGraphDataset(Dataset):
             # Store additional metadata
             node_kinds=node_kind_features,
             node_ids=torch.tensor([n["id"] for n in nodes], dtype=torch.long),
+            spans=node_spans,
             file=graph_dict.get("file", ""),
         )
         
