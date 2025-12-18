@@ -1,8 +1,9 @@
 import ast
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Set
 
 from ir.schema import CPGNode, CPGEdge
 from cpg.parse import get_span, extract_code
+from cpg.pattern_matcher import PatternMatcher
 
 
 KIND_MAP = {
@@ -36,8 +37,9 @@ KIND_MAP = {
 
 
 class ASTCPGBuilder(ast.NodeVisitor):
-    def __init__(self, file_path: str, source: str):
+    def __init__(self, file_path: str, source: str, pattern_matcher: Optional[PatternMatcher] = None):
         self.file = file_path
+        self.source = source
         self.source_lines = source.splitlines()
         self.nodes: List[CPGNode] = []
         self.edges: List[CPGEdge] = []
@@ -53,6 +55,9 @@ class ASTCPGBuilder(ast.NodeVisitor):
         self._node_ids: Dict[ast.AST, int] = {}
         # Stack of enclosing loops (for future extensions such as break/continue)
         self._loop_stack: List[ast.AST] = []
+        # Pattern matcher for source/sink/sanitizer detection
+        self.pattern_matcher = pattern_matcher
+        self._frameworks: Optional[Set[str]] = None
 
     
     def _new_id(self):
@@ -128,6 +133,33 @@ class ASTCPGBuilder(ast.NodeVisitor):
                 attrs["ContainerType"] = container
             else:
                 attrs["DataType"] = type_hint
+        
+        # Pattern matching: detect sources, sinks, and sanitizers
+        if self.pattern_matcher:
+            # Detect frameworks once (lazy)
+            if self._frameworks is None:
+                self._frameworks = self.pattern_matcher.detect_frameworks(self.source)
+            
+            # Match source
+            source_id = self.pattern_matcher.match_source(code, kind, self._frameworks)
+            if source_id:
+                attrs["is_source"] = "true"
+                attrs["source_id"] = source_id
+            
+            # Match sink
+            sink_match = self.pattern_matcher.match_sink(code, kind, self._frameworks)
+            if sink_match:
+                sink_id, sink_kind = sink_match
+                attrs["is_sink"] = "true"
+                attrs["sink_id"] = sink_id
+                attrs["sink_kind"] = sink_kind
+            
+            # Match sanitizer
+            sanitizer_match = self.pattern_matcher.match_sanitizer(code, kind)
+            if sanitizer_match:
+                sanitizer_id, sanitizer_kind = sanitizer_match
+                attrs["sanitizer_kind"] = sanitizer_kind
+                attrs["sanitizer_id"] = sanitizer_id
 
         cpg_node = CPGNode(
             id=node_id,
