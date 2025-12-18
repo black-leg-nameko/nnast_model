@@ -118,10 +118,16 @@ def main(argv: Optional[list[str]] = None) -> int:
             builder = ASTCPGBuilder(str(py), src, pattern_matcher=pattern_matcher)
             builder.visit(tree)
 
+            # Add framework metadata to graph
+            graph_metadata = {}
+            if builder.pattern_matcher and builder._frameworks:
+                graph_metadata["frameworks"] = list(builder._frameworks)
+            
             graph = CPGGraph(
                 file=str(py),
                 nodes=builder.nodes,
                 edges=builder.edges,
+                metadata=graph_metadata if graph_metadata else None,
             )
 
             # Optionally merge dynamic data-flow (DDFG) edges from taint records.

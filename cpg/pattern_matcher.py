@@ -4,6 +4,7 @@ Pattern matcher for CPG nodes based on patterns.yaml definitions.
 This module loads YAML pattern definitions and matches CPG nodes against
 source/sink/sanitizer signatures.
 """
+import ast
 import yaml
 import pathlib
 from typing import Dict, List, Optional, Set, Any, Tuple
@@ -201,7 +202,7 @@ class PatternMatcher:
                 return True
         return False
     
-    def match_source(self, node_code: str, node_kind: str, frameworks: Optional[Set[str]] = None) -> Optional[str]:
+    def match_source(self, node_code: str, node_kind: str, frameworks: Optional[Set[str]] = None) -> Optional[Dict[str, Any]]:
         """
         Match a node against source patterns.
         
@@ -211,7 +212,8 @@ class PatternMatcher:
             frameworks: Set of detected frameworks (e.g., {"flask", "django"})
         
         Returns:
-            Source ID if matched, None otherwise
+            Dict with source_id and source_kinds if matched, None otherwise
+            Format: {"source_id": str, "source_kinds": List[str]}
         """
         frameworks = frameworks or set()
         
@@ -221,26 +223,40 @@ class PatternMatcher:
                 if not any(fw in frameworks for fw in source.frameworks):
                     continue
             
+            matched = False
+            
             # Match calls
             if source.match_calls and node_kind == "Call":
                 if self._match_call_pattern(node_code, source.match_calls):
-                    return source_id
+                    matched = True
             
             # Match attributes
-            if source.match_attrs:
+            if source.match_attrs and not matched:
                 if node_kind == "Attribute":
                     if self._match_attr_pattern(node_code, source.match_attrs):
-                        return source_id
+                        matched = True
                 elif node_kind == "Call":
                     # For method calls, also check if the base attribute matches
                     # e.g., "request.args.get('id')" -> check "request.args"
                     base_attr = self._extract_base_attr_from_call(node_code)
                     if base_attr and self._match_attr_pattern(base_attr, source.match_attrs):
-                        return source_id
+                        matched = True
+            
+            if matched:
+                return {
+                    "source_id": source_id,
+                    "source_kinds": source.kinds
+                }
         
         return None
     
-    def match_sink(self, node_code: str, node_kind: str, frameworks: Optional[Set[str]] = None) -> Optional[Tuple[str, str]]:
+    def match_sink(
+        self, 
+        node_code: str, 
+        node_kind: str, 
+        frameworks: Optional[Set[str]] = None,
+        ast_node: Optional[Any] = None
+    ) -> Optional[Dict[str, Any]]:
         """
         Match a node against sink patterns.
         
@@ -248,9 +264,11 @@ class PatternMatcher:
             node_code: Code string of the node
             node_kind: Node kind (e.g., "Call")
             frameworks: Set of detected frameworks
+            ast_node: Optional AST node for constraint checking
         
         Returns:
-            Tuple of (sink_id, sink_kind) if matched, None otherwise
+            Dict with sink_id, sink_kind, and constraint_satisfied if matched, None otherwise
+            Format: {"sink_id": str, "sink_kind": str, "constraint_satisfied": bool}
         """
         frameworks = frameworks or set()
         
@@ -260,21 +278,75 @@ class PatternMatcher:
                 if not any(fw in frameworks for fw in sink.frameworks):
                     continue
             
+            matched = False
+            
             # Match calls
             if sink.match_calls and node_kind == "Call":
                 if self._match_call_pattern(node_code, sink.match_calls):
-                    # TODO: Check constraints (e.g., shell=True, verify=False)
-                    # For now, we skip constraint checking
-                    return (sink_id, sink.kind)
+                    matched = True
             
             # Match attributes
             if sink.match_attrs and node_kind == "Attribute":
                 if self._match_attr_pattern(node_code, sink.match_attrs):
-                    return (sink_id, sink.kind)
+                    matched = True
+            
+            if matched:
+                # Check constraints if sink has them
+                constraint_satisfied = True
+                if sink.constraints and ast_node is not None:
+                    constraint_satisfied = self._check_constraints(ast_node, sink.constraints)
+                
+                return {
+                    "sink_id": sink_id,
+                    "sink_kind": sink.kind,
+                    "constraint_satisfied": constraint_satisfied
+                }
         
         return None
     
-    def match_sanitizer(self, node_code: str, node_kind: str) -> Optional[Tuple[str, str]]:
+    def _check_constraints(self, ast_node: Any, constraints: Dict[str, Any]) -> bool:
+        """
+        Check if AST node satisfies sink constraints.
+        
+        Args:
+            ast_node: AST node (should be ast.Call for function calls)
+            constraints: Constraints dict from YAML
+        
+        Returns:
+            True if constraints are satisfied, False otherwise
+        """
+        if not isinstance(ast_node, ast.Call):
+            return False
+        
+        # Check kwargs constraints (e.g., shell=True, verify=False)
+        if "kwargs" in constraints:
+            required_kwargs = constraints["kwargs"]
+            # Build dict of actual keyword arguments
+            actual_kwargs = {}
+            for kw in ast_node.keywords:
+                if isinstance(kw.arg, str):
+                    # Get the value (simplified: check for True/False constants)
+                    if isinstance(kw.value, ast.Constant):
+                        actual_kwargs[kw.arg] = kw.value.value
+                    # Note: ast.NameConstant was removed in Python 3.8, using ast.Constant only
+            
+            # Check if all required kwargs match
+            for key, required_value in required_kwargs.items():
+                if key not in actual_kwargs:
+                    return False
+                if actual_kwargs[key] != required_value:
+                    return False
+        
+        # Check any_of constraints (e.g., multiple constraint options)
+        if "any_of" in constraints:
+            for constraint_option in constraints["any_of"]:
+                if self._check_constraints(ast_node, constraint_option):
+                    return True
+            return False
+        
+        return True
+    
+    def match_sanitizer(self, node_code: str, node_kind: str) -> Optional[Dict[str, str]]:
         """
         Match a node against sanitizer patterns.
         
@@ -283,18 +355,25 @@ class PatternMatcher:
             node_kind: Node kind (e.g., "Call")
         
         Returns:
-            Tuple of (sanitizer_id, sanitizer_kind) if matched, None otherwise
+            Dict with sanitizer_id and sanitizer_kind if matched, None otherwise
+            Format: {"sanitizer_id": str, "sanitizer_kind": str}
         """
         for sanitizer_id, sanitizer in self.sanitizers.items():
             # Match calls
             if sanitizer.match_calls and node_kind == "Call":
                 if self._match_call_pattern(node_code, sanitizer.match_calls):
-                    return (sanitizer_id, sanitizer.kind)
+                    return {
+                        "sanitizer_id": sanitizer_id,
+                        "sanitizer_kind": sanitizer.kind
+                    }
             
             # Match attributes
             if sanitizer.match_attrs and node_kind == "Attribute":
                 if self._match_attr_pattern(node_code, sanitizer.match_attrs):
-                    return (sanitizer_id, sanitizer.kind)
+                    return {
+                        "sanitizer_id": sanitizer_id,
+                        "sanitizer_kind": sanitizer.kind
+                    }
         
         return None
     

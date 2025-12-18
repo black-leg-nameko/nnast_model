@@ -141,25 +141,33 @@ class ASTCPGBuilder(ast.NodeVisitor):
                 self._frameworks = self.pattern_matcher.detect_frameworks(self.source)
             
             # Match source
-            source_id = self.pattern_matcher.match_source(code, kind, self._frameworks)
-            if source_id:
+            source_match = self.pattern_matcher.match_source(code, kind, self._frameworks)
+            if source_match:
                 attrs["is_source"] = "true"
-                attrs["source_id"] = source_id
+                attrs["source_id"] = source_match["source_id"]
+                # Add source_kinds as comma-separated string
+                if source_match.get("source_kinds"):
+                    attrs["source_kinds"] = ",".join(source_match["source_kinds"])
             
-            # Match sink
-            sink_match = self.pattern_matcher.match_sink(code, kind, self._frameworks)
+            # Match sink (pass AST node for constraint checking)
+            sink_match = self.pattern_matcher.match_sink(
+                code, kind, self._frameworks, 
+                ast_node=node if isinstance(node, ast.Call) else None
+            )
             if sink_match:
-                sink_id, sink_kind = sink_match
                 attrs["is_sink"] = "true"
-                attrs["sink_id"] = sink_id
-                attrs["sink_kind"] = sink_kind
+                attrs["sink_id"] = sink_match["sink_id"]
+                attrs["sink_kind"] = sink_match["sink_kind"]
+                # Only mark as sink if constraints are satisfied
+                if not sink_match.get("constraint_satisfied", True):
+                    # Still mark as sink but add constraint_failed flag
+                    attrs["sink_constraint_failed"] = "true"
             
             # Match sanitizer
             sanitizer_match = self.pattern_matcher.match_sanitizer(code, kind)
             if sanitizer_match:
-                sanitizer_id, sanitizer_kind = sanitizer_match
-                attrs["sanitizer_kind"] = sanitizer_kind
-                attrs["sanitizer_id"] = sanitizer_id
+                attrs["sanitizer_kind"] = sanitizer_match["sanitizer_kind"]
+                attrs["sanitizer_id"] = sanitizer_match["sanitizer_id"]
 
         cpg_node = CPGNode(
             id=node_id,
