@@ -336,6 +336,7 @@ class CPGNodePairModel(nn.Module):
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
         self.gnn_type = gnn_type
+        self.dropout = dropout
         
         # Input projection
         self.input_proj = nn.Linear(input_dim, hidden_dim)

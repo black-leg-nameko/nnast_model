@@ -207,10 +207,17 @@ def run_inference(
                     graph_dict = dataset.graphs[i]
                     file_path = graph_dict.get("file", "")
                 
-                # Get metadata from batch_info
+                # Get metadata / taint info from batch_info
                 metadata = {}
+                taint_info = None
                 if batch_info and i < len(batch_info) and batch_info[i]:
-                    metadata = batch_info[i].get("metadata", {})
+                    info_i = batch_info[i]
+                    # Labels-based metadata (supervised学習用)
+                    if isinstance(info_i, dict):
+                        metadata = info_i.get("metadata", {})
+                        # DTAベースのtaint情報が含まれている場合は保持しておく
+                        if "source_id" in info_i and "sink_id" in info_i:
+                            taint_info = info_i
 
                 # --- Node ID -> 行範囲(span) 情報の構築 ---
                 node_spans: List[Dict[str, Any]] = []
@@ -266,6 +273,45 @@ def run_inference(
                     result["line_range"] = line_range
                 if node_spans:
                     result["node_spans"] = node_spans
+
+                # --- DTA/taint情報がある場合は、特定ノード集合を「脆弱パス」としてマーク ---
+                # 既に CPGGraphDataset.__getitem__ で source_id / sink_id / path_ids にマッピング済みなので、
+                # ここでは対応するspanを逆引きして JSON に落とす。
+                if taint_info and node_spans:
+                    # node_id -> span の逆引きテーブル
+                    span_by_id = {
+                        ns["node_id"]: ns["span"]
+                        for ns in node_spans
+                        if isinstance(ns, dict) and "node_id" in ns and "span" in ns
+                    }
+
+                    src_id = taint_info.get("source_id")
+                    sink_id = taint_info.get("sink_id")
+                    path_ids = taint_info.get("path_ids", []) or []
+                    meta = taint_info.get("meta", {})
+
+                    vulnerable_nodes = []
+                    for nid in [src_id, *path_ids, sink_id]:
+                        if nid is None:
+                            continue
+                        span = span_by_id.get(nid)
+                        if not span:
+                            continue
+                        vulnerable_nodes.append(
+                            {
+                                "node_id": int(nid),
+                                "span": span,
+                            }
+                        )
+
+                    if vulnerable_nodes:
+                        result["taint_flow"] = {
+                            "source_node_id": int(src_id) if src_id is not None else None,
+                            "sink_node_id": int(sink_id) if sink_id is not None else None,
+                            "path_node_ids": [int(pid) for pid in path_ids],
+                            "meta": meta,
+                            "vulnerable_spans": vulnerable_nodes,
+                        }
                 
                 # Add metadata if available
                 if metadata:
