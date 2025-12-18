@@ -1,0 +1,397 @@
+version: 1
+
+language: python
+scope: webapp_sast
+
+notes:
+  - "Pattern IDs are training labels. Reporting maps them to OWASP/CWE externally."
+  - "sources/sinks/sanitizers are heuristic signatures; false positives/negatives are expected and measured."
+  - "AUTHZ_* patterns have higher FP rates due to static analysis limitations; this is documented in the paper."
+
+common:
+  sources:
+    # framework-agnostic
+    - id: SRC_ENV
+      kinds: [env]
+      match:
+        calls:
+          - "os.getenv"
+          - "os.environ.get"
+    
+    - id: SRC_ARGPARSE
+      kinds: [cli]
+      match:
+        calls:
+          - "argparse.ArgumentParser.parse_args"
+    
+    # flask
+    - id: SRC_FLASK_REQUEST
+      kinds: [http_request]
+      frameworks: [flask]
+      match:
+        attrs:
+          - "flask.request.args"
+          - "flask.request.form"
+          - "flask.request.values"
+          - "flask.request.json"
+          - "flask.request.data"
+          - "flask.request.headers"
+          - "flask.request.cookies"
+          - "flask.request.get_json"
+          - "flask.request.view_args"
+    
+    # django
+    - id: SRC_DJANGO_REQUEST
+      kinds: [http_request]
+      frameworks: [django]
+      match:
+        attrs:
+          - "request.GET"
+          - "request.POST"
+          - "request.body"
+          - "request.headers"
+          - "request.COOKIES"
+          - "request.META"
+          - "request.resolver_match.kwargs"
+    
+    # fastapi / starlette
+    - id: SRC_FASTAPI_REQUEST
+      kinds: [http_request]
+      frameworks: [fastapi, starlette]
+      match:
+        attrs:
+          - "fastapi.Request.query_params"
+          - "fastapi.Request.path_params"
+          - "fastapi.Request.headers"
+          - "fastapi.Request.cookies"
+          - "fastapi.Request.client"
+          - "starlette.requests.Request.query_params"
+          - "starlette.requests.Request.path_params"
+          - "starlette.requests.Request.headers"
+          - "starlette.requests.Request.cookies"
+        calls:
+          - "fastapi.Request.json"
+          - "fastapi.Request.body"
+          - "starlette.requests.Request.json"
+          - "starlette.requests.Request.body"
+
+  sanitizers:
+    - id: SAN_URL_ENCODE
+      kind: url_encode
+      match:
+        calls:
+          - "urllib.parse.quote"
+          - "urllib.parse.quote_plus"
+          - "requests.utils.requote_uri"
+    
+    - id: SAN_HTML_ESCAPE
+      kind: html_escape
+      match:
+        calls:
+          - "html.escape"
+          - "markupsafe.escape"
+          - "django.utils.html.escape"
+          - "bleach.clean"
+    
+    - id: SAN_SQL_PARAM
+      kind: sql_parameterization
+      match:
+        # ORM param binding style hints
+        calls:
+          - "sqlite3.Cursor.execute"
+          - "psycopg2.cursor.execute"
+          - "mysql.connector.cursor.execute"
+      notes:
+        - "This sanitizer is conditional: only when query uses placeholders (%s, ?, :name) and user input is passed as params argument."
+        - "CPG generator must check: query string contains placeholders AND tainted data is in params, not in query string itself."
+    
+    - id: SAN_JWT_VERIFY
+      kind: jwt_verify
+      match:
+        calls:
+          - "jwt.decode"
+      notes:
+        - "Used as a 'sanity' marker when verify options are enabled; see pattern JWT_VERIFY_DISABLED."
+
+patterns:
+  - id: SQLI_RAW_STRING_FORMAT
+    owasp: "A03: Injection"
+    cwe: ["CWE-89"]
+    description: "SQL built by str.format / % formatting and executed via raw query APIs."
+    sources: ["SRC_FLASK_REQUEST", "SRC_DJANGO_REQUEST", "SRC_FASTAPI_REQUEST"]
+    sinks:
+      - id: SINK_DBAPI_EXECUTE
+        kind: sql_exec
+        match:
+          calls:
+            - "sqlite3.Cursor.execute"
+            - "psycopg2.cursor.execute"
+            - "mysql.connector.cursor.execute"
+      - id: SINK_SQLALCHEMY_TEXT
+        kind: sql_exec
+        match:
+          calls:
+            - "sqlalchemy.text"
+    sanitizers: ["SAN_SQL_PARAM"]
+    match_heuristics:
+      - "Detect string formatting operators (str.format, %, .format()) feeding into sink query argument."
+      - "Exclude cases where SAN_SQL_PARAM applies (placeholders + params)."
+
+  - id: SQLI_RAW_STRING_CONCAT
+    owasp: "A03: Injection"
+    cwe: ["CWE-89"]
+    description: "SQL built by '+' concatenation and executed via raw query APIs."
+    sources: ["SRC_FLASK_REQUEST", "SRC_DJANGO_REQUEST", "SRC_FASTAPI_REQUEST"]
+    sinks:
+      - id: SINK_DBAPI_EXECUTE
+        kind: sql_exec
+        match:
+          calls:
+            - "sqlite3.Cursor.execute"
+            - "psycopg2.cursor.execute"
+            - "mysql.connector.cursor.execute"
+    sanitizers: ["SAN_SQL_PARAM"]
+    match_heuristics:
+      - "Detect BinOp(Add) chains or ''.join() feeding into sink query argument."
+      - "Exclude cases where SAN_SQL_PARAM applies."
+
+  - id: SQLI_RAW_FSTRING
+    owasp: "A03: Injection"
+    cwe: ["CWE-89"]
+    description: "SQL built via f-string and executed via raw query APIs."
+    sources: ["SRC_FLASK_REQUEST", "SRC_DJANGO_REQUEST", "SRC_FASTAPI_REQUEST"]
+    sinks:
+      - id: SINK_DBAPI_EXECUTE
+        kind: sql_exec
+        match:
+          calls:
+            - "sqlite3.Cursor.execute"
+            - "psycopg2.cursor.execute"
+            - "mysql.connector.cursor.execute"
+    sanitizers: ["SAN_SQL_PARAM"]
+    match_heuristics:
+      - "Detect JoinedStr (f-string) flowing into sink."
+      - "Exclude cases where SAN_SQL_PARAM applies."
+
+  - id: CMDI_SUBPROCESS_SHELL_TRUE
+    owasp: "A03: Injection"
+    cwe: ["CWE-78"]
+    description: "subprocess call with shell=True where command is tainted."
+    sources: ["SRC_FLASK_REQUEST", "SRC_DJANGO_REQUEST", "SRC_FASTAPI_REQUEST", "SRC_ENV"]
+    sinks:
+      - id: SINK_SUBPROCESS
+        kind: cmd_exec
+        match:
+          calls:
+            - "subprocess.run"
+            - "subprocess.call"
+            - "subprocess.Popen"
+            - "asyncio.create_subprocess_shell"
+        constraints:
+          kwargs:
+            shell: true
+    sanitizers: []
+    match_heuristics:
+      - "Taint must reach the command string/list argument when shell=True."
+
+  - id: CMDI_OS_SYSTEM_TAINTED
+    owasp: "A03: Injection"
+    cwe: ["CWE-78"]
+    description: "os.system / os.popen called with tainted input."
+    sources: ["SRC_FLASK_REQUEST", "SRC_DJANGO_REQUEST", "SRC_FASTAPI_REQUEST", "SRC_ENV"]
+    sinks:
+      - id: SINK_OS_SYSTEM
+        kind: cmd_exec
+        match:
+          calls:
+            - "os.system"
+            - "os.popen"
+            - "os.execl"
+            - "os.execv"
+    sanitizers: []
+    match_heuristics:
+      - "Taint must reach command argument."
+
+  - id: TEMPLATE_INJECTION_JINJA2_UNSAFE
+    owasp: "A03: Injection"
+    cwe: ["CWE-94", "CWE-1336"]
+    description: "Jinja2 template constructed from tainted string and rendered."
+    sources: ["SRC_FLASK_REQUEST", "SRC_DJANGO_REQUEST", "SRC_FASTAPI_REQUEST"]
+    sinks:
+      - id: SINK_JINJA2_TEMPLATE
+        kind: template_exec
+        match:
+          calls:
+            - "jinja2.Template"
+            - "jinja2.Environment.from_string"
+            - "flask.render_template_string"
+    sanitizers: ["SAN_HTML_ESCAPE"]
+    match_heuristics:
+      - "Tainted template string reaches Template/from_string/render_template_string."
+
+  - id: XSS_MARKUPSAFE_MARKUP_TAINTED
+    owasp: "A03: Injection"
+    cwe: ["CWE-79"]
+    description: "markupsafe.Markup constructed from tainted input (trusting user HTML)."
+    sources: ["SRC_FLASK_REQUEST", "SRC_DJANGO_REQUEST", "SRC_FASTAPI_REQUEST"]
+    sinks:
+      - id: SINK_MARKUPSAFE_MARKUP
+        kind: html_sink
+        match:
+          calls:
+            - "markupsafe.Markup"
+    sanitizers: ["SAN_HTML_ESCAPE"]
+    match_heuristics:
+      - "Tainted string flows into Markup() without prior escaping."
+
+  - id: XSS_RAW_HTML_RESPONSE_TAINTED
+    owasp: "A03: Injection"
+    cwe: ["CWE-79"]
+    description: "Tainted input written directly into HTML response construction."
+    sources: ["SRC_FLASK_REQUEST", "SRC_DJANGO_REQUEST", "SRC_FASTAPI_REQUEST"]
+    sinks:
+      - id: SINK_HTML_RESPONSE
+        kind: html_sink
+        match:
+          calls:
+            - "flask.make_response"
+            - "flask.Response"
+            - "django.http.HttpResponse"
+            - "starlette.responses.HTMLResponse"
+    sanitizers: ["SAN_HTML_ESCAPE"]
+    match_heuristics:
+      - "Tainted reaches response body argument; allowlisted if escaped."
+
+  - id: SSRF_REQUESTS_URL_TAINTED
+    owasp: "A10: SSRF"
+    cwe: ["CWE-918"]
+    description: "requests.* called with tainted URL."
+    sources: ["SRC_FLASK_REQUEST", "SRC_DJANGO_REQUEST", "SRC_FASTAPI_REQUEST"]
+    sinks:
+      - id: SINK_REQUESTS
+        kind: http_client
+        match:
+          calls:
+            - "requests.get"
+            - "requests.post"
+            - "requests.put"
+            - "requests.delete"
+            - "requests.request"
+    sanitizers: ["SAN_URL_ENCODE"]
+    match_heuristics:
+      - "Tainted reaches the URL/first positional argument or url= kwarg."
+
+  - id: SSRF_URLLIB_URL_TAINTED
+    owasp: "A10: SSRF"
+    cwe: ["CWE-918"]
+    description: "urllib.request.urlopen called with tainted URL."
+    sources: ["SRC_FLASK_REQUEST", "SRC_DJANGO_REQUEST", "SRC_FASTAPI_REQUEST"]
+    sinks:
+      - id: SINK_URLLIB
+        kind: http_client
+        match:
+          calls:
+            - "urllib.request.urlopen"
+    sanitizers: ["SAN_URL_ENCODE"]
+    match_heuristics:
+      - "Tainted reaches urlopen argument."
+
+  - id: SSRF_HTTPX_URL_TAINTED
+    owasp: "A10: SSRF"
+    cwe: ["CWE-918"]
+    description: "httpx client called with tainted URL."
+    sources: ["SRC_FLASK_REQUEST", "SRC_DJANGO_REQUEST", "SRC_FASTAPI_REQUEST"]
+    sinks:
+      - id: SINK_HTTPX
+        kind: http_client
+        match:
+          calls:
+            - "httpx.get"
+            - "httpx.post"
+            - "httpx.request"
+            - "httpx.Client.get"
+            - "httpx.Client.post"
+            - "httpx.Client.request"
+    sanitizers: ["SAN_URL_ENCODE"]
+    match_heuristics:
+      - "Tainted reaches the URL argument."
+
+  - id: AUTHZ_MISSING_DECORATOR
+    owasp: "A01: Broken Access Control"
+    cwe: ["CWE-285"]
+    description: "Endpoint missing authentication/authorization decorator (limited heuristic)."
+    sources: ["SRC_FLASK_REQUEST", "SRC_DJANGO_REQUEST", "SRC_FASTAPI_REQUEST"]
+    sinks:
+      - id: SINK_ENDPOINT_DEF
+        kind: endpoint
+        match:
+          frameworks:
+            flask:
+              decorators_any_of: ["@app.route", "@blueprint.route"]
+            django:
+              decorators_any_of: ["@login_required", "@permission_required", "@user_passes_test"]
+            fastapi:
+              decorators_any_of: ["@app.get", "@app.post", "@router.get", "@router.post"]
+    sanitizers: []
+    match_heuristics:
+      - "This is structural: flag endpoints lacking known auth decorators. Expect higher FP."
+      - "Note: Static analysis limitation - cannot detect programmatic auth checks or middleware."
+
+  - id: AUTHZ_DIRECT_OBJECT_REFERENCE_TAINTED
+    owasp: "A01: Broken Access Control"
+    cwe: ["CWE-639"]
+    description: "Tainted object ID used directly in data access without ownership check (very limited heuristic)."
+    sources: ["SRC_FLASK_REQUEST", "SRC_DJANGO_REQUEST", "SRC_FASTAPI_REQUEST"]
+    sinks:
+      - id: SINK_DATA_ACCESS
+        kind: data_access
+        match:
+          calls:
+            - "sqlalchemy.orm.Query.get"
+            - "django.db.models.query.QuerySet.get"
+            - "django.db.models.query.QuerySet.filter"
+    sanitizers: []
+    match_heuristics:
+      - "Look for id from request flowing into get/filter without a nearby ownership predicate."
+      - "Very limited: cannot detect complex authorization logic. Expect high FP."
+
+  - id: CRYPTO_WEAK_HASH_MD5_SHA1
+    owasp: "A02: Cryptographic Failures"
+    cwe: ["CWE-327"]
+    description: "Use of MD5/SHA1 for security-sensitive hashing."
+    sources: ["SRC_FLASK_REQUEST", "SRC_DJANGO_REQUEST", "SRC_FASTAPI_REQUEST", "SRC_ENV", "SRC_ARGPARSE"]
+    sinks:
+      - id: SINK_HASHLIB_WEAK
+        kind: crypto
+        match:
+          calls:
+            - "hashlib.md5"
+            - "hashlib.sha1"
+    sanitizers: []
+    match_heuristics:
+      - "Flag if used on password/token/user identifiers or in auth flows (heuristic via call context)."
+
+  - id: JWT_VERIFY_DISABLED
+    owasp: "A07: Identification and Authentication Failures"
+    cwe: ["CWE-345"]
+    description: "jwt.decode called with verification disabled or insecure options."
+    sources: ["SRC_FLASK_REQUEST", "SRC_DJANGO_REQUEST", "SRC_FASTAPI_REQUEST", "SRC_ENV"]
+    sinks:
+      - id: SINK_JWT_DECODE
+        kind: auth
+        match:
+          calls:
+            - "jwt.decode"
+        constraints:
+          any_of:
+            - kwargs:
+                options:
+                  verify_signature: false
+            - kwargs:
+                verify: false
+            - kwargs:
+                algorithms: ["none"]
+    sanitizers: ["SAN_JWT_VERIFY"]
+    match_heuristics:
+      - "Detect explicit disabling of verification in jwt.decode call options."
+
