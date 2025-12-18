@@ -17,12 +17,13 @@ from torch.utils.data import DataLoader
 from torch_geometric.data import Batch
 from tqdm import tqdm
 
-from ml.model import CPGTaintFlowModel
+from ml.model import CPGTaintFlowModel, CPGNodePairModel
 from ml.dataset import CPGGraphDataset
 from ml.embed_codebert import CodeBERTEmbedder
 from data.github_api import load_env_file
 import subprocess
 import tempfile
+from typing import Any, Tuple
 
 
 def collate_fn(batch):
@@ -152,11 +153,206 @@ def load_model(checkpoint_path: Path, device: torch.device) -> CPGTaintFlowModel
     return model
 
 
+def load_nodepair_model(checkpoint_path: Path, device: torch.device) -> CPGNodePairModel:
+    """
+    Load trained NodePair model from checkpoint.
+    
+    Args:
+        checkpoint_path: Path to NodePair model checkpoint
+        device: Device to load model on
+        
+    Returns:
+        Loaded NodePair model
+    """
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    
+    # Try to get model config from checkpoint
+    if "args" in checkpoint:
+        args = checkpoint["args"]
+        config = {
+            "input_dim": 768,  # CodeBERT embedding dimension
+            "hidden_dim": args.get("hidden_dim", 256),
+            "num_layers": args.get("num_layers", 3),
+            "gnn_type": args.get("gnn_type", "GAT").upper(),
+            "dropout": args.get("dropout", 0.5),
+        }
+    elif "config" in checkpoint:
+        config = checkpoint["config"]
+    elif "model_state_dict" in checkpoint:
+        state_dict = checkpoint["model_state_dict"]
+        first_layer_key = [k for k in state_dict.keys() if "input_proj" in k][0]
+        input_dim = state_dict[first_layer_key].shape[1]
+        config = {
+            "input_dim": input_dim,
+            "hidden_dim": 256,
+            "num_layers": 3,
+            "gnn_type": "GAT",
+            "dropout": 0.5,
+        }
+    else:
+        config = {
+            "input_dim": 768,
+            "hidden_dim": 256,
+            "num_layers": 3,
+            "gnn_type": "GAT",
+            "dropout": 0.5,
+        }
+    
+    model = CPGNodePairModel(**config)
+    
+    # Load state dict
+    if "model_state_dict" in checkpoint:
+        model.load_state_dict(checkpoint["model_state_dict"])
+    else:
+        model.load_state_dict(checkpoint)
+    
+    model.to(device)
+    model.eval()
+    
+    return model
+
+
+# Common dangerous API patterns for sink detection
+DANGEROUS_SINK_PATTERNS = {
+    # SQL injection
+    "execute", "query", "cursor.execute", "run_sql_query", "executescript",
+    # Command injection
+    "system", "popen", "call", "run", "check_call", "check_output",
+    # Code injection
+    "eval", "exec", "__import__", "compile",
+    # File operations (path traversal)
+    "open", "file", "read", "write",
+    # Deserialization
+    "loads", "load", "pickle.loads", "yaml.load",
+    # Other
+    "render_template_string", "mark_safe",
+}
+
+
+def extract_source_sink_candidates(
+    graph_dict: Dict[str, Any],
+    node_ids: List[int],
+    node_kinds: List[str]
+) -> Tuple[List[int], List[int]]:
+    """
+    Extract source and sink candidate node IDs from CPG graph.
+    
+    Args:
+        graph_dict: CPG graph dictionary
+        node_ids: List of node IDs in the graph (local indices)
+        node_kinds: List of node kinds corresponding to node_ids
+        
+    Returns:
+        Tuple of (source_candidate_indices, sink_candidate_indices)
+    """
+    nodes = graph_dict.get("nodes", [])
+    
+    # Build node_id -> node mapping
+    node_by_id = {n["id"]: n for n in nodes}
+    
+    source_candidates = []
+    sink_candidates = []
+    
+    for local_idx, (node_id, kind) in enumerate(zip(node_ids, node_kinds)):
+        node = node_by_id.get(node_id)
+        if not node:
+            continue
+        
+        # Source candidates: function arguments, input-related nodes
+        if kind in ["Arg", "Name"]:
+            # Check if it's likely an input (function parameter or common input names)
+            symbol = node.get("symbol", "")
+            code = node.get("code", "").lower()
+            if kind == "Arg" or any(pattern in code for pattern in ["input", "request", "args", "kwargs", "data", "user"]):
+                source_candidates.append(local_idx)
+        
+        # Sink candidates: dangerous API calls
+        if kind == "Call":
+            code = node.get("code", "").lower()
+            symbol = node.get("symbol", "").lower()
+            
+            # Check if function name matches dangerous patterns
+            for pattern in DANGEROUS_SINK_PATTERNS:
+                if pattern in code or pattern in symbol:
+                    sink_candidates.append(local_idx)
+                    break
+    
+    return source_candidates, sink_candidates
+
+
+def predict_node_pairs(
+    nodepair_model: CPGNodePairModel,
+    graph_data: Any,  # PyG Data object
+    source_candidates: List[int],
+    sink_candidates: List[int],
+    device: torch.device,
+    top_k: int = 3
+) -> List[Dict[str, Any]]:
+    """
+    Predict top-k node pairs using NodePair model.
+    
+    Args:
+        nodepair_model: Trained NodePair model
+        graph_data: PyG Data object for a single graph
+        source_candidates: List of source candidate node indices (local)
+        sink_candidates: List of sink candidate node indices (local)
+        device: Device to run on
+        top_k: Number of top pairs to return
+        
+    Returns:
+        List of predicted pairs with scores, sorted by score descending
+    """
+    if not source_candidates or not sink_candidates:
+        return []
+    
+    # Create batch with single graph
+    batch = Batch.from_data_list([graph_data]).to(device)
+    
+    # Generate all candidate pairs
+    pairs = []
+    for src_idx in source_candidates:
+        for sink_idx in sink_candidates:
+            if src_idx == sink_idx:
+                continue
+            pairs.append((src_idx, sink_idx))
+    
+    if not pairs:
+        return []
+    
+    # Score all pairs in batches
+    batch_size = 32
+    all_scores = []
+    
+    for i in range(0, len(pairs), batch_size):
+        batch_pairs = pairs[i:i + batch_size]
+        source_ids = torch.tensor([p[0] for p in batch_pairs], dtype=torch.long, device=device)
+        sink_ids = torch.tensor([p[1] for p in batch_pairs], dtype=torch.long, device=device)
+        
+        # Forward pass
+        logits = nodepair_model(batch, source_ids, sink_ids)
+        probs = F.softmax(logits, dim=1)
+        scores = probs[:, 1].cpu().tolist()  # Probability of "taint flow exists"
+        
+        all_scores.extend([
+            {
+                "source_idx": int(src_idx),
+                "sink_idx": int(sink_idx),
+                "score": float(score)
+            }
+            for (src_idx, sink_idx), score in zip(batch_pairs, scores)
+        ])
+    
+    # Sort by score and return top-k
+    all_scores.sort(key=lambda x: x["score"], reverse=True)
+    return all_scores[:top_k]
+
+
 def run_inference(
     model: CPGTaintFlowModel,
     dataset: CPGGraphDataset,
     device: torch.device,
-    batch_size: int = 32
+    batch_size: int = 32,
+    nodepair_model: Optional[CPGNodePairModel] = None
 ) -> List[Dict]:
     """
     Run inference on dataset.
@@ -313,6 +509,105 @@ def run_inference(
                             "vulnerable_spans": vulnerable_nodes,
                         }
                 
+                # --- DTAなし & is_vulnerable=True の場合、NodePairModelでペア推定 ---
+                if (
+                    nodepair_model is not None
+                    and result["is_vulnerable"]
+                    and not taint_info  # DTA情報がない場合のみ
+                    and node_spans
+                ):
+                    try:
+                        # グラフデータを取得（単一グラフとして）
+                        graph_dict = dataset.graphs[i] if i < len(dataset.graphs) else None
+                        if graph_dict:
+                            # グラフのノードIDとkindを取得
+                            graph_node_ids = node_ids_list
+                            graph_node_kinds = []
+                            if hasattr(batch_graphs, "node_kinds"):
+                                node_kinds_tensor = batch_graphs.node_kinds[graph_mask]
+                                # node_kindsはインデックスなので、元のkind名に戻す必要がある
+                                # 簡易版: datasetから取得
+                                nodes = graph_dict.get("nodes", [])
+                                node_id_to_kind = {n["id"]: n.get("kind", "Unknown") for n in nodes}
+                                graph_node_kinds = [node_id_to_kind.get(nid, "Unknown") for nid in graph_node_ids]
+                            
+                            # Source/sink候補を抽出
+                            source_candidates, sink_candidates = extract_source_sink_candidates(
+                                graph_dict, graph_node_ids, graph_node_kinds
+                            )
+                            
+                            if source_candidates and sink_candidates:
+                                # 単一グラフのDataオブジェクトを作成
+                                from torch_geometric.data import Data
+                                single_graph_data = Data(
+                                    x=batch_graphs.x[graph_mask],
+                                    edge_index=batch_graphs.edge_index[:, 
+                                        (batch_graphs.batch[batch_graphs.edge_index[0]] == i) &
+                                        (batch_graphs.batch[batch_graphs.edge_index[1]] == i)
+                                    ],
+                                    node_ids=batch_graphs.node_ids[graph_mask],
+                                    spans=batch_graphs.spans[graph_mask] if hasattr(batch_graphs, "spans") else None,
+                                )
+                                
+                                # エッジインデックスをローカルに再マッピング
+                                if single_graph_data.edge_index.numel() > 0:
+                                    local_node_map = {old_idx: new_idx for new_idx, old_idx in enumerate(torch.where(graph_mask)[0])}
+                                    edge_list = []
+                                    for edge_idx in range(single_graph_data.edge_index.size(1)):
+                                        src_global = single_graph_data.edge_index[0, edge_idx].item()
+                                        dst_global = single_graph_data.edge_index[1, edge_idx].item()
+                                        src_local = local_node_map.get(src_global)
+                                        dst_local = local_node_map.get(dst_global)
+                                        if src_local is not None and dst_local is not None:
+                                            edge_list.append([src_local, dst_local])
+                                    if edge_list:
+                                        single_graph_data.edge_index = torch.tensor(edge_list, dtype=torch.long).t().contiguous()
+                                    else:
+                                        single_graph_data.edge_index = torch.empty((2, 0), dtype=torch.long)
+                                
+                                # NodePairModelでペア推定
+                                predicted_pairs = predict_node_pairs(
+                                    nodepair_model,
+                                    single_graph_data,
+                                    source_candidates,
+                                    sink_candidates,
+                                    device,
+                                    top_k=3
+                                )
+                                
+                                if predicted_pairs:
+                                    # node_id -> span の逆引きテーブル
+                                    span_by_id = {
+                                        ns["node_id"]: ns["span"]
+                                        for ns in node_spans
+                                        if isinstance(ns, dict) and "node_id" in ns and "span" in ns
+                                    }
+                                    
+                                    # 最高スコアのペアを選ぶ
+                                    best_pair = predicted_pairs[0]
+                                    src_node_id = graph_node_ids[best_pair["source_idx"]]
+                                    sink_node_id = graph_node_ids[best_pair["sink_idx"]]
+                                    
+                                    vulnerable_spans = []
+                                    for nid in [src_node_id, sink_node_id]:
+                                        span = span_by_id.get(nid)
+                                        if span:
+                                            vulnerable_spans.append({
+                                                "node_id": int(nid),
+                                                "span": span
+                                            })
+                                    
+                                    if vulnerable_spans:
+                                        result["predicted_taint_flow"] = {
+                                            "source_node_id": int(src_node_id),
+                                            "sink_node_id": int(sink_node_id),
+                                            "score": best_pair["score"],
+                                            "vulnerable_spans": vulnerable_spans,
+                                        }
+                    except Exception as e:
+                        # NodePair推定に失敗した場合はスキップ（エラーを出さない）
+                        pass
+                
                 # Add metadata if available
                 if metadata:
                     result["repo_url"] = metadata.get("repo_url", "")
@@ -361,6 +656,12 @@ def main():
         default="",
         help="Repository URL (for metadata in results)"
     )
+    parser.add_argument(
+        "--nodepair-model",
+        type=Path,
+        default=None,
+        help="Path to trained NodePair model checkpoint (optional, for predicting source/sink pairs without DTA)"
+    )
     
     args = parser.parse_args()
     
@@ -401,10 +702,26 @@ def main():
     else:
         model_path = args.model
     
-    # Load model
+    # Load main model
     print(f"Loading model from {model_path}...")
     model = load_model(model_path, device)
     print("Model loaded successfully")
+    
+    # Load NodePair model if provided
+    nodepair_model = None
+    if args.nodepair_model:
+        if not args.nodepair_model.exists():
+            print(f"Warning: NodePair model not found: {args.nodepair_model}")
+            print("  Continuing without NodePair predictions...")
+        else:
+            print(f"Loading NodePair model from {args.nodepair_model}...")
+            try:
+                nodepair_model = load_nodepair_model(args.nodepair_model, device)
+                print("NodePair model loaded successfully")
+            except Exception as e:
+                print(f"Warning: Failed to load NodePair model: {e}")
+                print("  Continuing without NodePair predictions...")
+                nodepair_model = None
     
     # Prepare input
     input_path = Path(args.input)
@@ -484,7 +801,7 @@ def main():
     
     # Run inference
     print("Running inference...")
-    results = run_inference(model, dataset, device, args.batch_size)
+    results = run_inference(model, dataset, device, args.batch_size, nodepair_model=nodepair_model)
     
     # Add repo_url to results if provided
     if args.repo_url:
