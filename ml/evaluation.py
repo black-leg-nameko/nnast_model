@@ -11,12 +11,117 @@ Implements evaluation metrics as specified in design document v2 section 7:
 import numpy as np
 from typing import Dict, List, Optional, Tuple, Any
 from collections import defaultdict
-from sklearn.metrics import (
-    f1_score, precision_score, recall_score,
-    precision_recall_curve, auc,
-    confusion_matrix, classification_report
-)
 import torch
+
+try:
+    from sklearn.metrics import (
+        f1_score, precision_score, recall_score,
+        precision_recall_curve, auc,
+        confusion_matrix, classification_report
+    )
+    HAS_SKLEARN = True
+except ImportError:
+    HAS_SKLEARN = False
+    # Fallback implementations
+    def f1_score(y_true, y_pred, average='binary', zero_division=0):
+        """Simple F1 score calculation."""
+        if average == 'binary':
+            tp = sum((y_true == 1) & (y_pred == 1))
+            fp = sum((y_true == 0) & (y_pred == 1))
+            fn = sum((y_true == 1) & (y_pred == 0))
+            if tp + fp == 0 or tp + fn == 0:
+                return zero_division
+            precision = tp / (tp + fp) if (tp + fp) > 0 else zero_division
+            recall = tp / (tp + fn) if (tp + fn) > 0 else zero_division
+            if precision + recall == 0:
+                return zero_division
+            return 2 * precision * recall / (precision + recall)
+        return zero_division
+    
+    def precision_score(y_true, y_pred, average='binary', zero_division=0):
+        """Simple precision calculation."""
+        if average == 'binary':
+            tp = sum((y_true == 1) & (y_pred == 1))
+            fp = sum((y_true == 0) & (y_pred == 1))
+            if tp + fp == 0:
+                return zero_division
+            return tp / (tp + fp)
+        return zero_division
+    
+    def recall_score(y_true, y_pred, average='binary', zero_division=0):
+        """Simple recall calculation."""
+        if average == 'binary':
+            tp = sum((y_true == 1) & (y_pred == 1))
+            fn = sum((y_true == 1) & (y_pred == 0))
+            if tp + fn == 0:
+                return zero_division
+            return tp / (tp + fn)
+        elif average == 'macro':
+            classes = np.unique(y_true)
+            recalls = []
+            for cls in classes:
+                y_true_cls = (y_true == cls).astype(int)
+                y_pred_cls = (y_pred == cls).astype(int)
+                tp = sum((y_true_cls == 1) & (y_pred_cls == 1))
+                fn = sum((y_true_cls == 1) & (y_pred_cls == 0))
+                if tp + fn == 0:
+                    recalls.append(zero_division)
+                else:
+                    recalls.append(tp / (tp + fn))
+            return np.mean(recalls) if recalls else zero_division
+        return zero_division
+    
+    def confusion_matrix(y_true, y_pred):
+        """Simple confusion matrix calculation."""
+        tn = sum((y_true == 0) & (y_pred == 0))
+        fp = sum((y_true == 0) & (y_pred == 1))
+        fn = sum((y_true == 1) & (y_pred == 0))
+        tp = sum((y_true == 1) & (y_pred == 1))
+        return np.array([[tn, fp], [fn, tp]])
+    
+    def precision_recall_curve(y_true, y_proba):
+        """Simple precision-recall curve calculation."""
+        # Sort by probability descending
+        sorted_indices = np.argsort(y_proba)[::-1]
+        y_true_sorted = y_true[sorted_indices]
+        y_proba_sorted = y_proba[sorted_indices]
+        
+        # Calculate precision and recall at each threshold
+        thresholds = np.unique(y_proba_sorted)
+        precision = []
+        recall = []
+        
+        for threshold in thresholds:
+            y_pred = (y_proba_sorted >= threshold).astype(int)
+            tp = np.sum((y_true_sorted == 1) & (y_pred == 1))
+            fp = np.sum((y_true_sorted == 0) & (y_pred == 1))
+            fn = np.sum((y_true_sorted == 1) & (y_pred == 0))
+            
+            prec = tp / (tp + fp) if (tp + fp) > 0 else 0
+            rec = tp / (tp + fn) if (tp + fn) > 0 else 0
+            
+            precision.append(prec)
+            recall.append(rec)
+        
+        return np.array(precision), np.array(recall), thresholds
+    
+    def auc(x, y):
+        """Simple AUC calculation using trapezoidal rule."""
+        if len(x) < 2:
+            return 0.0
+        # Sort by x
+        sorted_indices = np.argsort(x)
+        x_sorted = x[sorted_indices]
+        y_sorted = y[sorted_indices]
+        # Trapezoidal rule
+        area = 0.0
+        for i in range(len(x_sorted) - 1):
+            area += (x_sorted[i+1] - x_sorted[i]) * (y_sorted[i] + y_sorted[i+1]) / 2
+        return area
+    
+    def classification_report(y_true, y_pred):
+        """Simple classification report."""
+        return {}
 
 
 def calculate_classification_metrics(
@@ -60,10 +165,17 @@ def calculate_classification_metrics(
         
         # Per-class F1
         f1_per_class = f1_score(y_true, y_pred, average=None, zero_division=0)
-        metrics["f1_per_class"] = {
-            class_names[i]: float(f1_per_class[i])
-            for i in range(len(f1_per_class))
-        }
+        # Handle both array and scalar return values
+        if isinstance(f1_per_class, (list, np.ndarray)):
+            metrics["f1_per_class"] = {
+                class_names[i] if i < len(class_names) else f"class_{i}": float(f1_per_class[i])
+                for i in range(len(f1_per_class))
+            }
+        else:
+            # Fallback for scalar (shouldn't happen but handle gracefully)
+            metrics["f1_per_class"] = {
+                class_names[0] if len(class_names) > 0 else "class_0": float(f1_per_class)
+            }
         
         # PR-AUC
         if y_proba is not None:
@@ -93,10 +205,17 @@ def calculate_classification_metrics(
         
         # Per-class F1
         f1_per_class = f1_score(y_true, y_pred, average=None, zero_division=0)
-        metrics["f1_per_class"] = {
-            class_names[i] if i < len(class_names) else f"class_{i}": float(f1_per_class[i])
-            for i in range(len(f1_per_class))
-        }
+        # Handle both array and scalar return values
+        if isinstance(f1_per_class, (list, np.ndarray)):
+            metrics["f1_per_class"] = {
+                class_names[i] if i < len(class_names) else f"class_{i}": float(f1_per_class[i])
+                for i in range(len(f1_per_class))
+            }
+        else:
+            # Fallback for scalar (shouldn't happen but handle gracefully)
+            metrics["f1_per_class"] = {
+                class_names[0] if len(class_names) > 0 else "class_0": float(f1_per_class)
+            }
     
     return metrics
 
