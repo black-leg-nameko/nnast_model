@@ -346,13 +346,19 @@ class PatternMatcher:
         
         return True
     
-    def match_sanitizer(self, node_code: str, node_kind: str) -> Optional[Dict[str, str]]:
+    def match_sanitizer(
+        self, 
+        node_code: str, 
+        node_kind: str,
+        ast_node: Optional[Any] = None
+    ) -> Optional[Dict[str, str]]:
         """
         Match a node against sanitizer patterns.
         
         Args:
             node_code: Code string of the node
             node_kind: Node kind (e.g., "Call")
+            ast_node: Optional AST node for conditional sanitizer checks
         
         Returns:
             Dict with sanitizer_id and sanitizer_kind if matched, None otherwise
@@ -362,6 +368,12 @@ class PatternMatcher:
             # Match calls
             if sanitizer.match_calls and node_kind == "Call":
                 if self._match_call_pattern(node_code, sanitizer.match_calls):
+                    # Special handling for conditional sanitizers
+                    if sanitizer_id == "SAN_SQL_PARAM":
+                        # Check if this is actually a parameterized query
+                        if not self._check_sql_parameterization(ast_node):
+                            continue  # Skip if not parameterized
+                    
                     return {
                         "sanitizer_id": sanitizer_id,
                         "sanitizer_kind": sanitizer.kind
@@ -376,6 +388,61 @@ class PatternMatcher:
                     }
         
         return None
+    
+    def _check_sql_parameterization(self, ast_node: Optional[Any]) -> bool:
+        """
+        Check if SQL execute call uses parameterized queries.
+        
+        A parameterized query must:
+        1. Have a query string with placeholders (%s, ?, :name)
+        2. Have user input passed as params argument (not in query string)
+        
+        Args:
+            ast_node: AST Call node for cursor.execute(query, params)
+        
+        Returns:
+            True if this is a parameterized query, False otherwise
+        """
+        if not isinstance(ast_node, ast.Call):
+            return False
+        
+        # cursor.execute(query, params) typically has 2+ arguments
+        if len(ast_node.args) < 2:
+            return False
+        
+        # First argument should be the query string
+        query_arg = ast_node.args[0]
+        
+        # Try to extract query string (simplified: only handles string literals)
+        query_string = None
+        if isinstance(query_arg, ast.Constant) and isinstance(query_arg.value, str):
+            query_string = query_arg.value
+        elif isinstance(query_arg, ast.JoinedStr):
+            # f-string: not parameterized (user input in query string)
+            return False
+        
+        # If we can't extract the query string statically, be conservative
+        if query_string is None:
+            # Check if second argument exists (params)
+            # If params exist, assume it might be parameterized
+            return len(ast_node.args) >= 2
+        
+        # Check for placeholders in query string
+        has_placeholder = False
+        placeholder_patterns = ['%s', '%d', '%f', '?', ':name', ':id', ':value']
+        
+        for pattern in placeholder_patterns:
+            if pattern in query_string:
+                has_placeholder = True
+                break
+        
+        # Also check for named placeholders (e.g., %(name)s)
+        import re
+        if re.search(r'%\([^)]+\)[sd]', query_string):
+            has_placeholder = True
+        
+        # Must have placeholder AND params argument
+        return has_placeholder and len(ast_node.args) >= 2
     
     def detect_frameworks(self, source_code: str) -> Set[str]:
         """
