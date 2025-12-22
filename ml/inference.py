@@ -20,6 +20,7 @@ from tqdm import tqdm
 from ml.model import CPGTaintFlowModel, CPGNodePairModel
 from ml.dataset import CPGGraphDataset
 from ml.embed_codebert import CodeBERTEmbedder
+from ml.owasp_mapper import OWASPMapper
 from data.github_api import load_env_file
 import subprocess
 import tempfile
@@ -363,7 +364,9 @@ def run_inference(
     dataset: CPGGraphDataset,
     device: torch.device,
     batch_size: int = 32,
-    nodepair_model: Optional[CPGNodePairModel] = None
+    nodepair_model: Optional[CPGNodePairModel] = None,
+    owasp_mapper: Optional[OWASPMapper] = None,
+    use_owasp_format: bool = False
 ) -> List[Dict]:
     """
     Run inference on dataset.
@@ -519,6 +522,70 @@ def run_inference(
                             "meta": meta,
                             "vulnerable_spans": vulnerable_nodes,
                         }
+                        
+                        # Infer pattern_id and add OWASP/CWE information
+                        if owasp_mapper:
+                            # Get source/sink IDs from nodes or meta
+                            source_id_from_meta = meta.get("source_id")
+                            sink_id_from_meta = meta.get("sink_id")
+                            sink_kind_from_meta = meta.get("sink_kind")
+                            node_code = None
+                            
+                            # Try to get source/sink IDs from nodes
+                            graph_dict = dataset.graphs[i] if i < len(dataset.graphs) else None
+                            if graph_dict:
+                                if src_id is not None:
+                                    src_node = next((n for n in graph_dict.get("nodes", []) if n["id"] == src_id), None)
+                                    if src_node:
+                                        src_attrs = src_node.get("attrs", {}) or {}
+                                        source_id_from_meta = source_id_from_meta or src_attrs.get("source_id")
+                                
+                                if sink_id is not None:
+                                    sink_node = next((n for n in graph_dict.get("nodes", []) if n["id"] == sink_id), None)
+                                    if sink_node:
+                                        sink_attrs = sink_node.get("attrs", {}) or {}
+                                        sink_id_from_meta = sink_id_from_meta or sink_attrs.get("sink_id")
+                                        sink_kind_from_meta = sink_kind_from_meta or sink_attrs.get("sink_kind")
+                                        node_code = sink_node.get("code")
+                            
+                            pattern_id = owasp_mapper.infer_pattern_id(
+                                source_id=source_id_from_meta,
+                                sink_id=sink_id_from_meta,
+                                sink_kind=sink_kind_from_meta,
+                                node_code=node_code
+                            )
+                            
+                            if pattern_id:
+                                result["pattern_id"] = pattern_id
+                                
+                                # Add OWASP/CWE information
+                                if use_owasp_format:
+                                    # Use design document 5.3 format
+                                    lines = None
+                                    if line_range:
+                                        lines = list(range(line_range[0], line_range[1] + 1))
+                                    elif vulnerable_nodes:
+                                        # Extract line numbers from vulnerable spans
+                                        lines = []
+                                        for vs in vulnerable_nodes:
+                                            span = vs.get("span")
+                                            if span and len(span) >= 2:
+                                                lines.append(span[0])  # start_line
+                                    
+                                    owasp_result = owasp_mapper.format_result(
+                                        pattern_id=pattern_id,
+                                        confidence=result["confidence"],
+                                        file_path=file_path,
+                                        lines=lines,
+                                        line_range=line_range
+                                    )
+                                    result["owasp_mapping"] = owasp_result
+                                else:
+                                    # Add OWASP/CWE fields to existing result
+                                    result["owasp"] = owasp_mapper.get_owasp(pattern_id)
+                                    result["cwe_id"] = owasp_mapper.get_primary_cwe(pattern_id)
+                                    if result["cwe_id"]:
+                                        result["cwe"] = owasp_mapper.get_cwe(pattern_id)
                 
                 # --- DTAなし & is_vulnerable=True の場合、NodePairModelでペア推定 ---
                 if (
@@ -673,6 +740,11 @@ def main():
         default=None,
         help="Path to trained NodePair model checkpoint (optional, for predicting source/sink pairs without DTA)"
     )
+    parser.add_argument(
+        "--owasp-format",
+        action="store_true",
+        help="Use OWASP format (design document 5.3) for output"
+    )
     
     args = parser.parse_args()
     
@@ -810,9 +882,24 @@ def main():
         print("Error: No graphs in dataset")
         return 1
     
+    # Initialize OWASP mapper
+    owasp_mapper = None
+    use_owasp_format = getattr(args, 'owasp_format', False)
+    try:
+        owasp_mapper = OWASPMapper()
+        print(f"Loaded OWASP mapper: {len(owasp_mapper.get_all_patterns())} patterns")
+    except Exception as e:
+        print(f"Warning: Failed to load OWASP mapper: {e}")
+        print("  OWASP/CWE mapping will be skipped")
+    
     # Run inference
     print("Running inference...")
-    results = run_inference(model, dataset, device, args.batch_size, nodepair_model=nodepair_model)
+    results = run_inference(
+        model, dataset, device, args.batch_size,
+        nodepair_model=nodepair_model,
+        owasp_mapper=owasp_mapper,
+        use_owasp_format=use_owasp_format
+    )
     
     # Add repo_url to results if provided
     if args.repo_url:
