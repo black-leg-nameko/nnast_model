@@ -18,6 +18,11 @@ from tqdm import tqdm
 from ml.model import CPGTaintFlowModel, CPGNodePairModel
 from ml.dataset import CPGGraphDataset
 from ml.embed_codebert import CodeBERTEmbedder
+from ml.evaluation import (
+    calculate_classification_metrics,
+    format_metrics_report,
+    calculate_framework_metrics
+)
 from sklearn.metrics import f1_score, precision_score, recall_score
 
 
@@ -145,30 +150,57 @@ def evaluate(
             correct += (pred == labels).sum().item()
             total += labels.size(0)
             
-            # Collect predictions and labels for metrics
+            # Collect predictions, labels, and probabilities for metrics
             all_preds.extend(pred.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
+            
+            # Get probabilities for PR-AUC calculation
+            probs = torch.softmax(logits, dim=1)
+            all_probs.extend(probs[:, 1].cpu().numpy())  # Probability of vulnerable class
     
     avg_loss = total_loss / len(dataloader)
     accuracy = 100 * correct / total if total > 0 else 0.0
     
-    # Calculate additional metrics
-    if len(set(all_labels)) > 1:  # Only if we have both classes
-        f1 = f1_score(all_labels, all_preds, average='binary')
-        precision = precision_score(all_labels, all_preds, average='binary', zero_division=0)
-        recall = recall_score(all_labels, all_preds, average='binary', zero_division=0)
-    else:
-        f1 = 0.0
-        precision = 0.0
-        recall = 0.0
+    # Calculate comprehensive metrics using evaluation module
+    y_true = np.array(all_labels)
+    y_pred = np.array(all_preds)
+    y_proba = np.array(all_probs) if all_probs else None
     
-    return {
-        "loss": avg_loss,
-        "accuracy": accuracy,
-        "f1": f1,
-        "precision": precision,
-        "recall": recall
-    }
+    # Calculate comprehensive metrics
+    if len(set(all_labels)) > 1:  # Only if we have both classes
+        metrics = calculate_classification_metrics(
+            y_true, y_pred, y_proba,
+            class_names=["safe", "vulnerable"]
+        )
+        
+        # Keep backward compatibility with old metric names
+        return {
+            "loss": avg_loss,
+            "accuracy": accuracy,
+            "f1": metrics.get("f1_binary", 0.0),
+            "precision": metrics.get("precision_binary", 0.0),
+            "recall": metrics.get("recall_binary", 0.0),
+            # New comprehensive metrics
+            "f1_macro": metrics.get("f1_macro", 0.0),
+            "precision_macro": metrics.get("precision_macro", 0.0),
+            "recall_macro": metrics.get("recall_macro", 0.0),
+            "f1_per_class": metrics.get("f1_per_class", {}),
+            "pr_auc": metrics.get("pr_auc"),
+            **metrics  # Include all other metrics
+        }
+    else:
+        return {
+            "loss": avg_loss,
+            "accuracy": accuracy,
+            "f1": 0.0,
+            "precision": 0.0,
+            "recall": 0.0,
+            "f1_macro": 0.0,
+            "precision_macro": 0.0,
+            "recall_macro": 0.0,
+            "f1_per_class": {},
+            "pr_auc": None
+        }
 
 
 def main():
@@ -433,6 +465,8 @@ def main():
         "val_f1": [],
         "val_precision": [],
         "val_recall": [],
+        "val_f1_macro": [],
+        "val_pr_auc": [],
     }
     
     print("\nStarting training...")
@@ -464,6 +498,13 @@ def main():
                 f"Precision: {val_metrics['precision']:.4f}, "
                 f"Recall: {val_metrics['recall']:.4f}"
             )
+            if 'f1_macro' in val_metrics:
+                print(
+                    f"  Val Macro-F1: {val_metrics['f1_macro']:.4f}, "
+                    f"PR-AUC: {val_metrics.get('pr_auc', 'N/A')}"
+                )
+            if 'f1_per_class' in val_metrics and val_metrics['f1_per_class']:
+                print(f"  Per-class F1: {val_metrics['f1_per_class']}")
         
         # Debug: Check if model is learning
         if epoch == 1:
@@ -484,6 +525,9 @@ def main():
             history["val_f1"].append(val_metrics["f1"])
             history["val_precision"].append(val_metrics["precision"])
             history["val_recall"].append(val_metrics["recall"])
+            history["val_f1_macro"].append(val_metrics.get("f1_macro", 0.0))
+            pr_auc = val_metrics.get("pr_auc")
+            history["val_pr_auc"].append(pr_auc if pr_auc is not None else 0.0)
         
         # Save checkpoint
         checkpoint = {
