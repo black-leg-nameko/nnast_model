@@ -212,35 +212,25 @@ def load_nodepair_model(checkpoint_path: Path, device: torch.device) -> CPGNodeP
     return model
 
 
-# Common dangerous API patterns for sink detection
-DANGEROUS_SINK_PATTERNS = {
-    # SQL injection
-    "execute", "query", "cursor.execute", "run_sql_query", "executescript",
-    # Command injection
-    "system", "popen", "call", "run", "check_call", "check_output",
-    # Code injection
-    "eval", "exec", "__import__", "compile",
-    # File operations (path traversal)
-    "open", "file", "read", "write",
-    # Deserialization
-    "loads", "load", "pickle.loads", "yaml.load",
-    # Other
-    "render_template_string", "mark_safe",
-}
-
-
 def extract_source_sink_candidates(
     graph_dict: Dict[str, Any],
     node_ids: List[int],
-    node_kinds: List[str]
+    node_kinds: List[str],
+    use_yaml_patterns: bool = True
 ) -> Tuple[List[int], List[int]]:
     """
     Extract source and sink candidate node IDs from CPG graph.
+    
+    This function uses YAML-based pattern matching (via is_source/is_sink attributes)
+    that were added during CPG generation, falling back to heuristic detection
+    if attributes are not available.
     
     Args:
         graph_dict: CPG graph dictionary
         node_ids: List of node IDs in the graph (local indices)
         node_kinds: List of node kinds corresponding to node_ids
+        use_yaml_patterns: If True, use is_source/is_sink attributes from YAML patterns.
+                          If False, fall back to heuristic detection.
         
     Returns:
         Tuple of (source_candidate_indices, sink_candidate_indices)
@@ -258,24 +248,45 @@ def extract_source_sink_candidates(
         if not node:
             continue
         
-        # Source candidates: function arguments, input-related nodes
-        if kind in ["Arg", "Name"]:
-            # Check if it's likely an input (function parameter or common input names)
-            symbol = node.get("symbol", "")
-            code = node.get("code", "").lower()
-            if kind == "Arg" or any(pattern in code for pattern in ["input", "request", "args", "kwargs", "data", "user"]):
-                source_candidates.append(local_idx)
+        attrs = node.get("attrs", {}) or {}
         
-        # Sink candidates: dangerous API calls
-        if kind == "Call":
-            code = node.get("code", "").lower()
-            symbol = node.get("symbol", "").lower()
+        if use_yaml_patterns:
+            # Use YAML-based pattern matching attributes
+            if attrs.get("is_source") == "true":
+                source_candidates.append(local_idx)
             
-            # Check if function name matches dangerous patterns
-            for pattern in DANGEROUS_SINK_PATTERNS:
-                if pattern in code or pattern in symbol:
+            if attrs.get("is_sink") == "true":
+                # Only include sinks that satisfy constraints (if constraint checking was done)
+                if attrs.get("sink_constraint_failed") != "true":
                     sink_candidates.append(local_idx)
-                    break
+        else:
+            # Fallback: heuristic-based detection (for backward compatibility)
+            # Source candidates: function arguments, input-related nodes
+            if kind in ["Arg", "Name"]:
+                symbol = node.get("symbol", "")
+                code = node.get("code", "").lower()
+                if kind == "Arg" or any(pattern in code for pattern in ["input", "request", "args", "kwargs", "data", "user"]):
+                    source_candidates.append(local_idx)
+            
+            # Sink candidates: check for common dangerous patterns
+            if kind == "Call":
+                code = node.get("code", "").lower()
+                symbol = node.get("symbol", "").lower()
+                
+                # Common dangerous API patterns (fallback only)
+                dangerous_patterns = [
+                    "execute", "query", "cursor.execute", "run_sql_query", "executescript",
+                    "system", "popen", "call", "run", "check_call", "check_output",
+                    "eval", "exec", "__import__", "compile",
+                    "open", "file", "read", "write",
+                    "loads", "load", "pickle.loads", "yaml.load",
+                    "render_template_string", "mark_safe",
+                ]
+                
+                for pattern in dangerous_patterns:
+                    if pattern in code or pattern in symbol:
+                        sink_candidates.append(local_idx)
+                        break
     
     return source_candidates, sink_candidates
 
