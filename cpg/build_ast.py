@@ -1,8 +1,9 @@
 import ast
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Set
 
 from ir.schema import CPGNode, CPGEdge
 from cpg.parse import get_span, extract_code
+from cpg.pattern_matcher import PatternMatcher
 
 
 KIND_MAP = {
@@ -36,8 +37,9 @@ KIND_MAP = {
 
 
 class ASTCPGBuilder(ast.NodeVisitor):
-    def __init__(self, file_path: str, source: str):
+    def __init__(self, file_path: str, source: str, pattern_matcher: Optional[PatternMatcher] = None):
         self.file = file_path
+        self.source = source
         self.source_lines = source.splitlines()
         self.nodes: List[CPGNode] = []
         self.edges: List[CPGEdge] = []
@@ -53,6 +55,12 @@ class ASTCPGBuilder(ast.NodeVisitor):
         self._node_ids: Dict[ast.AST, int] = {}
         # Stack of enclosing loops (for future extensions such as break/continue)
         self._loop_stack: List[ast.AST] = []
+        # Pattern matcher for source/sink/sanitizer detection
+        self.pattern_matcher = pattern_matcher
+        self._frameworks: Optional[Set[str]] = None
+        # Track import aliases: {alias_name: full_module_path}
+        # e.g., {"request": "flask.request", "Request": "fastapi.Request"}
+        self._import_aliases: Dict[str, str] = {}
 
     
     def _new_id(self):
@@ -128,6 +136,48 @@ class ASTCPGBuilder(ast.NodeVisitor):
                 attrs["ContainerType"] = container
             else:
                 attrs["DataType"] = type_hint
+        
+        # Pattern matching: detect sources, sinks, and sanitizers
+        if self.pattern_matcher:
+            # Detect frameworks once (lazy)
+            if self._frameworks is None:
+                self._frameworks = self.pattern_matcher.detect_frameworks(self.source)
+            
+            # Resolve aliases in code for better matching
+            # e.g., "request.args.get('id')" -> "flask.request.args.get('id')" if request is imported from flask
+            resolved_code = self._resolve_aliases_in_code(code, node)
+            
+            # Match source
+            source_match = self.pattern_matcher.match_source(resolved_code, kind, self._frameworks)
+            if source_match:
+                attrs["is_source"] = "true"
+                attrs["source_id"] = source_match["source_id"]
+                # Add source_kinds as comma-separated string
+                if source_match.get("source_kinds"):
+                    attrs["source_kinds"] = ",".join(source_match["source_kinds"])
+            
+            # Match sink (pass AST node for constraint checking)
+            sink_match = self.pattern_matcher.match_sink(
+                resolved_code, kind, self._frameworks, 
+                ast_node=node if isinstance(node, ast.Call) else None
+            )
+            if sink_match:
+                attrs["is_sink"] = "true"
+                attrs["sink_id"] = sink_match["sink_id"]
+                attrs["sink_kind"] = sink_match["sink_kind"]
+                # Only mark as sink if constraints are satisfied
+                if not sink_match.get("constraint_satisfied", True):
+                    # Still mark as sink but add constraint_failed flag
+                    attrs["sink_constraint_failed"] = "true"
+            
+            # Match sanitizer (pass AST node for conditional checks like SQL parameterization)
+            sanitizer_match = self.pattern_matcher.match_sanitizer(
+                resolved_code, kind,
+                ast_node=node if isinstance(node, ast.Call) else None
+            )
+            if sanitizer_match:
+                attrs["sanitizer_kind"] = sanitizer_match["sanitizer_kind"]
+                attrs["sanitizer_id"] = sanitizer_match["sanitizer_id"]
 
         cpg_node = CPGNode(
             id=node_id,
@@ -379,7 +429,67 @@ class ASTCPGBuilder(ast.NodeVisitor):
 
         if new_scope:
             self._scopes.pop()
-
+    
+    def visit_Import(self, node: ast.Import):
+        """Track import statements for alias resolution."""
+        for alias in node.names:
+            if alias.asname:
+                # import module as alias
+                self._import_aliases[alias.asname] = alias.name
+            else:
+                # import module (use the last part as the alias)
+                parts = alias.name.split('.')
+                if parts:
+                    self._import_aliases[parts[-1]] = alias.name
+        
+        # Continue visiting children
+        self.generic_visit(node)
+    
+    def visit_ImportFrom(self, node: ast.ImportFrom):
+        """Track from-import statements for alias resolution."""
+        module = node.module or ""
+        for alias in node.names:
+            imported_name = alias.name
+            alias_name = alias.asname if alias.asname else imported_name
+            
+            # Build full path: module.imported_name
+            if module:
+                full_path = f"{module}.{imported_name}"
+            else:
+                full_path = imported_name
+            
+            self._import_aliases[alias_name] = full_path
+        
+        # Continue visiting children
+        self.generic_visit(node)
+    
+    def _resolve_aliases_in_code(self, code: str, ast_node: ast.AST) -> str:
+        """
+        Resolve import aliases in code string.
+        
+        Examples:
+            "request.args.get('id')" -> "flask.request.args.get('id')" if request is imported from flask
+            "Request.query_params" -> "fastapi.Request.query_params" if Request is imported from fastapi
+        """
+        if not self._import_aliases:
+            return code
+        
+        # Try to resolve the first identifier in the code
+        # This is a simple heuristic - for more complex cases, we'd need AST analysis
+        code_parts = code.split('.')
+        if code_parts:
+            first_part = code_parts[0].strip()
+            # Remove any trailing parentheses or whitespace
+            first_part = first_part.split('(')[0].strip()
+            
+            # Check if this is an alias
+            if first_part in self._import_aliases:
+                resolved_base = self._import_aliases[first_part]
+                # Replace the first part with the resolved alias
+                code_parts[0] = resolved_base
+                return '.'.join(code_parts)
+        
+        return code
 
     def build(self) -> Tuple[List[CPGNode], List[CPGEdge]]:
         return self.nodes, self.edges
