@@ -23,7 +23,6 @@ from ml.evaluation import (
     format_metrics_report,
     calculate_framework_metrics
 )
-from sklearn.metrics import f1_score, precision_score, recall_score
 
 
 def collate_fn(batch):
@@ -125,6 +124,7 @@ def evaluate(
     total = 0
     all_preds = []
     all_labels = []
+    all_probs = []
     
     with torch.no_grad():
         for batch_graphs, batch_info in tqdm(dataloader, desc="Evaluating"):

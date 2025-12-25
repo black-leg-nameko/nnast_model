@@ -122,7 +122,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             graph_metadata = {}
             if builder.pattern_matcher and builder._frameworks:
                 graph_metadata["frameworks"] = list(builder._frameworks)
-            
+
             graph = CPGGraph(
                 file=str(py),
                 nodes=builder.nodes,
