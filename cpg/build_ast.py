@@ -429,7 +429,7 @@ class ASTCPGBuilder(ast.NodeVisitor):
 
         if new_scope:
             self._scopes.pop()
-    
+
     def visit_Import(self, node: ast.Import):
         """Track import statements for alias resolution."""
         for alias in node.names:
