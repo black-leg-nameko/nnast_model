@@ -54,11 +54,20 @@ def generate_cpg_from_file(file_path: Path) -> Optional[Dict]:
         with tempfile.NamedTemporaryFile(mode='w', suffix='.jsonl', delete=False) as tmp_out:
             tmp_out_path = tmp_out.name
         
+        # Get project root for patterns.yaml
+        project_root = pathlib.Path(__file__).parent.parent
+        patterns_yaml = project_root / "patterns.yaml"
+        
+        cmd = [sys.executable, "-m", "cli", str(file_path), "--out", tmp_out_path]
+        if patterns_yaml.exists():
+            cmd.extend(["--patterns", str(patterns_yaml)])
+        
         result = subprocess.run(
-            [sys.executable, "-m", "cli", str(file_path), "--out", tmp_out_path],
+            cmd,
             capture_output=True,
             text=True,
-            timeout=30
+            timeout=30,
+            cwd=str(project_root)
         )
         
         if result.returncode == 0:
@@ -262,18 +271,18 @@ def extract_source_sink_candidates(
                     sink_candidates.append(local_idx)
         else:
             # Fallback: heuristic-based detection (for backward compatibility)
-            # Source candidates: function arguments, input-related nodes
-            if kind in ["Arg", "Name"]:
-                symbol = node.get("symbol", "")
-                code = node.get("code", "").lower()
-                if kind == "Arg" or any(pattern in code for pattern in ["input", "request", "args", "kwargs", "data", "user"]):
-                    source_candidates.append(local_idx)
-            
+        # Source candidates: function arguments, input-related nodes
+        if kind in ["Arg", "Name"]:
+            symbol = node.get("symbol", "")
+            code = node.get("code", "").lower()
+            if kind == "Arg" or any(pattern in code for pattern in ["input", "request", "args", "kwargs", "data", "user"]):
+                source_candidates.append(local_idx)
+        
             # Sink candidates: check for common dangerous patterns
-            if kind == "Call":
-                code = node.get("code", "").lower()
-                symbol = node.get("symbol", "").lower()
-                
+        if kind == "Call":
+            code = node.get("code", "").lower()
+            symbol = node.get("symbol", "").lower()
+            
                 # Common dangerous API patterns (fallback only)
                 dangerous_patterns = [
                     "execute", "query", "cursor.execute", "run_sql_query", "executescript",
@@ -285,9 +294,9 @@ def extract_source_sink_candidates(
                 ]
                 
                 for pattern in dangerous_patterns:
-                    if pattern in code or pattern in symbol:
-                        sink_candidates.append(local_idx)
-                        break
+                if pattern in code or pattern in symbol:
+                    sink_candidates.append(local_idx)
+                    break
     
     return source_candidates, sink_candidates
 
