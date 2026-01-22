@@ -1,5 +1,10 @@
 """
-Graph Neural Network model for taint flow prediction on CPG graphs.
+Graph Neural Network model for vulnerability risk scoring on CPG graphs.
+
+Improved architecture with:
+- Edge-type aware GNN layers (AST/CFG/DFG/DDFG distinction)
+- Multi-modal node features (CodeBERT + structural features)
+- Multi-scale feature aggregation
 """
 import torch
 import torch.nn as nn
@@ -7,8 +12,175 @@ import torch.nn.functional as F
 from torch_geometric.nn import GCNConv, GATConv, global_mean_pool, global_max_pool
 from torch_geometric.data import Data, Batch
 from torch_geometric.utils import add_self_loops, degree
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict
 import math
+
+
+class EdgeTypeAwareGATLayer(nn.Module):
+    """
+    Edge-type aware GAT layer that processes different edge types separately.
+    
+    This is crucial for CPG graphs where AST/CFG/DFG/DDFG edges have different semantics.
+    For example, DFG edges are critical for taint flow analysis.
+    """
+    
+    def __init__(
+        self,
+        in_dim: int,
+        out_dim: int,
+        num_edge_types: int = 4,  # AST, CFG, DFG, DDFG
+        heads: int = 4,
+        dropout: float = 0.5,
+    ):
+        super().__init__()
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.num_edge_types = num_edge_types
+        self.heads = heads
+        
+        # Edge-type specific attention layers
+        self.edge_type_layers = nn.ModuleList([
+            GATConv(in_dim, out_dim, heads=heads, concat=False, dropout=dropout)
+            for _ in range(num_edge_types)
+        ])
+        
+        # Learnable edge-type importance weights
+        self.edge_type_weights = nn.Parameter(torch.ones(num_edge_types) / num_edge_types)
+        
+        # Fusion layer to combine edge-type specific features
+        self.fusion = nn.Sequential(
+            nn.Linear(out_dim * num_edge_types, out_dim),
+            nn.LayerNorm(out_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout)
+        )
+        self.dropout = dropout
+    
+    def forward(
+        self,
+        x: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_attr: torch.Tensor  # Edge type indices (num_edges,)
+    ) -> torch.Tensor:
+        """
+        Forward pass with edge-type aware processing.
+        
+        Args:
+            x: Node features (num_nodes, in_dim)
+            edge_index: Edge connectivity (2, num_edges)
+            edge_attr: Edge type indices (num_edges,)
+            
+        Returns:
+            Updated node features (num_nodes, out_dim)
+        """
+        # Process each edge type separately
+        edge_type_outputs = []
+        
+        for edge_type in range(self.num_edge_types):
+            # Get edges of this type
+            edge_mask = (edge_attr == edge_type)
+            
+            if edge_mask.sum() == 0:
+                # No edges of this type, use zero features
+                edge_type_outputs.append(torch.zeros(x.size(0), self.out_dim, device=x.device))
+                continue
+            
+            # Extract edges of this type
+            edge_index_type = edge_index[:, edge_mask]
+            
+            # Process with type-specific layer
+            x_type = self.edge_type_layers[edge_type](x, edge_index_type)
+            edge_type_outputs.append(x_type)
+        
+        # Weighted combination of edge-type specific features
+        weights = F.softmax(self.edge_type_weights, dim=0)
+        weighted_outputs = [
+            output * weights[i] for i, output in enumerate(edge_type_outputs)
+        ]
+        
+        # Concatenate and fuse
+        x_concat = torch.cat(weighted_outputs, dim=1)  # (num_nodes, out_dim * num_edge_types)
+        x_out = self.fusion(x_concat)  # (num_nodes, out_dim)
+        
+        return x_out
+
+
+class MultiModalNodeEncoder(nn.Module):
+    """
+    Multi-modal node encoder combining:
+    - CodeBERT embeddings (semantic information)
+    - Node kind embeddings (structural information)
+    - Type hint embeddings (type information)
+    
+    This allows the model to leverage both semantic and structural features.
+    """
+    
+    def __init__(
+        self,
+        codebert_dim: int = 768,
+        node_kind_dim: int = 32,
+        type_hint_dim: int = 32,
+        out_dim: int = 256,
+        num_node_kinds: int = 50,
+        num_types: int = 100,
+    ):
+        super().__init__()
+        
+        # Embedding layers for structural features
+        self.node_kind_emb = nn.Embedding(num_node_kinds, node_kind_dim)
+        self.type_hint_emb = nn.Embedding(num_types, type_hint_dim)
+        
+        # Projection layers
+        self.codebert_proj = nn.Linear(codebert_dim, out_dim // 2)
+        self.structural_proj = nn.Linear(node_kind_dim + type_hint_dim, out_dim // 2)
+        
+        # Fusion layer
+        self.fusion = nn.Sequential(
+            nn.Linear(out_dim, out_dim),
+            nn.LayerNorm(out_dim),
+            nn.ReLU()
+        )
+    
+    def forward(
+        self,
+        codebert_emb: torch.Tensor,
+        node_kinds: torch.Tensor,
+        type_hints: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        Encode multi-modal node features.
+        
+        Args:
+            codebert_emb: CodeBERT embeddings (num_nodes, codebert_dim)
+            node_kinds: Node kind indices (num_nodes,)
+            type_hints: Type hint indices (num_nodes,) or None
+            
+        Returns:
+            Combined node features (num_nodes, out_dim)
+        """
+        # Semantic features (CodeBERT)
+        x_semantic = self.codebert_proj(codebert_emb)  # (num_nodes, out_dim // 2)
+        
+        # Structural features
+        node_kind_emb = self.node_kind_emb(node_kinds)  # (num_nodes, node_kind_dim)
+        
+        if type_hints is not None:
+            type_emb = self.type_hint_emb(type_hints)  # (num_nodes, type_hint_dim)
+            x_structural_raw = torch.cat([node_kind_emb, type_emb], dim=1)
+        else:
+            # If no type hints, pad with zeros
+            x_structural_raw = torch.cat([
+                node_kind_emb,
+                torch.zeros(node_kind_emb.size(0), self.type_hint_emb.embedding_dim, device=node_kind_emb.device)
+            ], dim=1)
+        
+        x_structural = self.structural_proj(x_structural_raw)  # (num_nodes, out_dim // 2)
+        
+        # Combine semantic and structural features
+        x_combined = torch.cat([x_semantic, x_structural], dim=1)  # (num_nodes, out_dim)
+        x_out = self.fusion(x_combined)
+        
+        return x_out
 
 
 class DynamicAttentionFusionLayer(nn.Module):
@@ -147,9 +319,15 @@ class CPGTaintFlowModel(nn.Module):
         dropout: float = 0.5,
         use_batch_norm: bool = True,
         use_dynamic_attention: bool = True,  # Enable dynamic attention fusion
+        use_edge_types: bool = True,  # Enable edge-type aware processing
+        use_multi_modal: bool = True,  # Enable multi-modal node features
+        use_multi_scale: bool = True,  # Enable multi-scale feature aggregation
+        num_edge_types: int = 4,  # Number of edge types (AST, CFG, DFG, DDFG)
+        num_node_kinds: int = 50,  # Number of node kinds
+        num_types: int = 100,  # Number of type hints
     ):
         """
-        Initialize CPG Risk Scoring Model with dynamic attention mechanism.
+        Initialize CPG Risk Scoring Model with improved architecture.
         
         Args:
             input_dim: Input node embedding dimension (CodeBERT: 768)
@@ -159,6 +337,12 @@ class CPGTaintFlowModel(nn.Module):
             dropout: Dropout rate
             use_batch_norm: Whether to use batch normalization
             use_dynamic_attention: Whether to use dynamic attention fusion mechanism
+            use_edge_types: Whether to use edge-type aware processing
+            use_multi_modal: Whether to use multi-modal node features
+            use_multi_scale: Whether to use multi-scale feature aggregation
+            num_edge_types: Number of edge types (AST, CFG, DFG, DDFG)
+            num_node_kinds: Number of node kinds
+            num_types: Number of type hints
         """
         super().__init__()
         
@@ -168,16 +352,41 @@ class CPGTaintFlowModel(nn.Module):
         self.gnn_type = gnn_type
         self.dropout = dropout
         self.use_dynamic_attention = use_dynamic_attention
+        self.use_edge_types = use_edge_types
+        self.use_multi_modal = use_multi_modal
+        self.use_multi_scale = use_multi_scale
         
-        # Early fusion: Input projection (combines CodeBERT embeddings with node attributes)
-        self.input_proj = nn.Linear(input_dim, hidden_dim)
+        # Multi-modal node encoder (if enabled)
+        if use_multi_modal:
+            self.node_encoder = MultiModalNodeEncoder(
+                codebert_dim=input_dim,
+                node_kind_dim=32,
+                type_hint_dim=32,
+                out_dim=hidden_dim,
+                num_node_kinds=num_node_kinds,
+                num_types=num_types,
+            )
+        else:
+            # Fallback: simple projection
+            self.input_proj = nn.Linear(input_dim, hidden_dim)
         
-        # GNN layers with dynamic attention fusion
+        # GNN layers with improved architecture
         self.gnn_layers = nn.ModuleList()
         self.batch_norms = nn.ModuleList() if use_batch_norm else None
         
         for i in range(num_layers):
-            if use_dynamic_attention:
+            if use_edge_types:
+                # Edge-type aware GAT layer
+                self.gnn_layers.append(
+                    EdgeTypeAwareGATLayer(
+                        in_dim=hidden_dim,
+                        out_dim=hidden_dim,
+                        num_edge_types=num_edge_types,
+                        heads=4,
+                        dropout=dropout
+                    )
+                )
+            elif use_dynamic_attention:
                 # Use dynamic attention fusion layer
                 self.gnn_layers.append(
                     DynamicAttentionFusionLayer(
@@ -212,10 +421,20 @@ class CPGTaintFlowModel(nn.Module):
             if use_batch_norm:
                 self.batch_norms.append(nn.BatchNorm1d(hidden_dim))
         
-        # Late fusion: Graph-level pooling combines GNN output and CodeBERT semantic representation
-        # GNN output: hidden_dim * 2 (mean + max pooling)
-        # CodeBERT semantic: input_dim (pooled CodeBERT embeddings)
-        self.pool_dim = hidden_dim * 2 + input_dim  # Mean + Max pooling + CodeBERT semantic
+        # Multi-scale aggregation weights (if enabled)
+        if use_multi_scale:
+            self.scale_weights = nn.Parameter(torch.ones(num_layers) / num_layers)
+        
+        # Late fusion: Graph-level pooling
+        if use_multi_scale:
+            # Multi-scale: aggregate features from all layers
+            pool_dim = hidden_dim * 2 * num_layers + input_dim
+        else:
+            # Single-scale: only last layer
+            pool_dim = hidden_dim * 2 + input_dim
+        
+        self.pool_dim = pool_dim
+        
         # Regression head: output single risk score
         self.regressor = nn.Sequential(
             nn.Linear(self.pool_dim, hidden_dim),
@@ -230,35 +449,68 @@ class CPGTaintFlowModel(nn.Module):
     
     def forward(self, data: Batch) -> torch.Tensor:
         """
-        Forward pass with dynamic attention fusion.
+        Forward pass with improved architecture.
         
-        Implements three-stage fusion strategy:
-        1. Early fusion: CodeBERT embeddings as initial node features
-        2. Intermediate fusion: Dynamic attention mechanism in GNN layers
-        3. Late fusion: Combine GNN graph-level representation with CodeBERT semantic representation
+        Implements:
+        1. Multi-modal node encoding (CodeBERT + structural features)
+        2. Edge-type aware GNN processing
+        3. Multi-scale feature aggregation
+        4. Late fusion with CodeBERT semantic representation
         
         Args:
-            data: PyTorch Geometric Batch object with 'codebert_emb' attribute
-            
+            data: PyTorch Geometric Batch object with:
+                - x: CodeBERT embeddings
+                - edge_index: Edge connectivity
+                - edge_attr: Edge type indices (if use_edge_types=True)
+                - node_kinds: Node kind indices (if use_multi_modal=True)
+                - batch: Batch assignment
+                
         Returns:
-            Risk scores tensor (batch_size, 1) - values in [0, 1]
+            Risk scores tensor (batch_size,) - values in [0, 1]
         """
-        x, edge_index, batch = data.x, data.edge_index, data.batch
+        x_codebert = data.x  # (num_nodes, input_dim)
+        edge_index = data.edge_index
+        batch = data.batch
         
-        # Get CodeBERT embeddings (for dynamic attention fusion)
+        # Get CodeBERT embeddings (for dynamic attention fusion if needed)
         if hasattr(data, 'codebert_emb'):
             codebert_emb = data.codebert_emb
         else:
-            # Fallback: use x as CodeBERT embeddings if not provided
-            codebert_emb = x
+            codebert_emb = x_codebert
         
-        # Early fusion: Input projection
-        x = self.input_proj(x)
-        x = F.relu(x)
+        # Get edge attributes (edge types)
+        if self.use_edge_types:
+            if hasattr(data, 'edge_attr') and data.edge_attr is not None:
+                edge_attr = data.edge_attr
+            else:
+                # Fallback: assume all edges are AST type (0)
+                edge_attr = torch.zeros(edge_index.size(1), dtype=torch.long, device=edge_index.device)
+        else:
+            edge_attr = None
         
-        # Intermediate fusion: GNN layers with dynamic attention
+        # Get node kinds (for multi-modal encoding)
+        if self.use_multi_modal:
+            if hasattr(data, 'node_kinds') and data.node_kinds is not None:
+                node_kinds = data.node_kinds
+            else:
+                # Fallback: use zeros
+                node_kinds = torch.zeros(x_codebert.size(0), dtype=torch.long, device=x_codebert.device)
+            
+            # Multi-modal node encoding
+            x = self.node_encoder(codebert_emb, node_kinds)
+        else:
+            # Simple projection
+            x = self.input_proj(x_codebert)
+            x = F.relu(x)
+        
+        # GNN layers with improved architecture
+        layer_outputs = []  # Store outputs for multi-scale aggregation
+        
         for i, gnn_layer in enumerate(self.gnn_layers):
-            if self.use_dynamic_attention:
+            if self.use_edge_types:
+                # Edge-type aware GAT layer
+                x_new = gnn_layer(x, edge_index, edge_attr)
+            elif self.use_dynamic_attention:
                 # Dynamic attention fusion layer
                 x_new = gnn_layer(x, codebert_emb, edge_index)
             else:
@@ -275,26 +527,54 @@ class CPGTaintFlowModel(nn.Module):
                 x = x + x_new
             else:
                 x = x_new
+            
+            # Store layer output for multi-scale aggregation
+            if self.use_multi_scale:
+                layer_outputs.append(x)
         
         # Late fusion: Graph-level pooling
-        # 1. GNN output pooling (structural features)
-        x_mean = global_mean_pool(x, batch)
-        x_max = global_max_pool(x, batch)
-        x_gnn_pooled = torch.cat([x_mean, x_max], dim=1)  # (batch_size, hidden_dim * 2)
+        if self.use_multi_scale:
+            # Multi-scale aggregation: pool each layer's output
+            pooled_features = []
+            for layer_out in layer_outputs:
+                mean_pool = global_mean_pool(layer_out, batch)
+                max_pool = global_max_pool(layer_out, batch)
+                pooled_features.append(torch.cat([mean_pool, max_pool], dim=1))
+            
+            # Weighted combination of multi-scale features
+            weights = F.softmax(self.scale_weights, dim=0)
+            x_gnn_pooled = sum(w * feat for w, feat in zip(weights, pooled_features))
+        else:
+            # Single-scale: only last layer
+            x_mean = global_mean_pool(x, batch)
+            x_max = global_max_pool(x, batch)
+            x_gnn_pooled = torch.cat([x_mean, x_max], dim=1)  # (batch_size, hidden_dim * 2)
         
-        # 2. CodeBERT semantic pooling (semantic features)
+        # CodeBERT semantic pooling (semantic features)
         codebert_mean = global_mean_pool(codebert_emb, batch)
-        codebert_max = global_max_pool(codebert_emb, batch)
-        # Use mean pooling for CodeBERT semantic representation
-        codebert_semantic = codebert_mean  # (batch_size, input_dim)
         
-        # 3. Combine GNN structural and CodeBERT semantic representations
-        x_pooled = torch.cat([x_gnn_pooled, codebert_semantic], dim=1)  # (batch_size, pool_dim)
+        # Combine GNN structural and CodeBERT semantic representations
+        x_pooled = torch.cat([x_gnn_pooled, codebert_mean], dim=1)  # (batch_size, pool_dim)
         
         # Regression: output risk score
         risk_scores = self.regressor(x_pooled)  # (batch_size, 1)
         
         return risk_scores.squeeze(-1)  # (batch_size,)
+    
+    def get_edge_type_importance(self) -> Optional[Dict[str, float]]:
+        """
+        Get learned importance weights for each edge type.
+        Useful for interpretability.
+        
+        Returns:
+            Dictionary mapping edge type names to importance weights, or None if not using edge types
+        """
+        if not self.use_edge_types or len(self.gnn_layers) == 0:
+            return None
+        
+        weights = F.softmax(self.gnn_layers[0].edge_type_weights, dim=0)
+        edge_type_names = ["AST", "CFG", "DFG", "DDFG"]
+        return {name: weight.item() for name, weight in zip(edge_type_names, weights)}
     
     def reset_parameters(self):
         """Reset model parameters for re-initialization."""

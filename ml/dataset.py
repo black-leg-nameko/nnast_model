@@ -177,17 +177,24 @@ class CPGGraphDataset(Dataset):
         else:
             edge_index = torch.empty((2, 0), dtype=torch.long)
         
-        # Build edge attributes (edge types as one-hot or indices)
-        # Only include edges that were successfully mapped
+        # Build edge attributes (edge types as fixed indices)
+        # Map edge kinds to fixed indices: AST=0, CFG=1, DFG=2, DDFG=3
+        # This ensures consistency across graphs and compatibility with EdgeTypeAwareGATLayer
+        EDGE_TYPE_MAP = {
+            "AST": 0,
+            "CFG": 1,
+            "DFG": 2,
+            "DDFG": 3,
+        }
+        
         if edges and edge_index.size(1) > 0:
             edge_kinds = []
             for e in edges:
                 if e["src"] in node_id_to_idx and e["dst"] in node_id_to_idx:
-                    edge_kinds.append(e.get("kind", "AST"))
-            # Map edge kinds to indices
-            unique_kinds = sorted(set(edge_kinds))
-            kind_to_idx = {k: i for i, k in enumerate(unique_kinds)}
-            edge_attr = torch.tensor([kind_to_idx[k] for k in edge_kinds], dtype=torch.long)
+                    edge_kind = e.get("kind", "AST")
+                    # Map to fixed index (default to AST if unknown)
+                    edge_kinds.append(EDGE_TYPE_MAP.get(edge_kind, 0))
+            edge_attr = torch.tensor(edge_kinds, dtype=torch.long)
         else:
             edge_attr = torch.empty((0,), dtype=torch.long)
         

@@ -605,16 +605,33 @@ def main():
         num_workers=0,
     )
     
-    # Initialize model (risk scoring regression)
-    print("Initializing risk scoring model...")
+    # Initialize model (risk scoring regression with improved architecture)
+    print("Initializing improved risk scoring model...")
     model = CPGTaintFlowModel(
         input_dim=768,
         hidden_dim=args.hidden_dim,
         num_layers=args.num_layers,
         gnn_type=args.gnn_type,
         dropout=0.5,
-        use_dynamic_attention=True,  # Enable dynamic attention fusion
+        use_dynamic_attention=False,  # Disabled when using edge-type aware layers
+        use_edge_types=True,  # Enable edge-type aware processing (AST/CFG/DFG/DDFG)
+        use_multi_modal=True,  # Enable multi-modal node features (CodeBERT + structural)
+        use_multi_scale=True,  # Enable multi-scale feature aggregation
+        num_edge_types=4,  # AST, CFG, DFG, DDFG
+        num_node_kinds=50,  # Approximate number of node kinds
+        num_types=100,  # Approximate number of type hints
     ).to(device)
+    
+    # Print model architecture info
+    print(f"Model architecture:")
+    print(f"  - Edge-type aware: {model.use_edge_types}")
+    print(f"  - Multi-modal nodes: {model.use_multi_modal}")
+    print(f"  - Multi-scale aggregation: {model.use_multi_scale}")
+    
+    # Print edge type importance (if available)
+    edge_importance = model.get_edge_type_importance()
+    if edge_importance:
+        print(f"  - Edge type importance: {edge_importance}")
     
     # Initialize model parameters properly
     def init_weights(m):
