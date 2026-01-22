@@ -236,29 +236,67 @@ class CPGGraphDataset(Dataset):
     def __len__(self) -> int:
         return len(self.graphs)
     
-    def __getitem__(self, idx: int) -> Tuple[Data, Optional[Dict[str, Any]]]:
+    def __getitem__(self, idx: int) -> Tuple[Data, Dict[str, Any]]:
         """
-        Get a graph and its associated label or taint records.
+        Get a graph and its associated weak signals.
         
         Returns:
-            Tuple of (graph_data, label_info)
+            Tuple of (graph_data, weak_signals)
             - graph_data: PyG Data object
-            - label_info: Dict with label and metadata if available, or taint_info if using taint records
+            - weak_signals: Dict with:
+                - risk_score: float ∈ [0, 1] (target for regression)
+                - bandit_score: float ∈ [0, 1]
+                - bandit_rules: list[str]
+                - patched_flag: bool
+                - synthetic_flag: bool
+                - metadata: dict with additional info
         """
         graph_dict = self.graphs[idx]
         graph_data = self._graph_to_pyg(graph_dict)
         
-        # Priority 1: Use labels if available (supervised learning)
+        # Initialize weak signals with defaults
+        weak_signals = {
+            "risk_score": 0.0,  # Target risk score (computed from weak signals)
+            "bandit_score": 0.0,
+            "bandit_rules": [],
+            "patched_flag": False,
+            "synthetic_flag": False,
+            "metadata": {},
+            "project": graph_dict.get("file", "").split("/")[0] if "/" in graph_dict.get("file", "") else "unknown"
+        }
+        
+        # Priority 1: Use labels if available (may contain weak signals)
         if self.labels is not None and idx < len(self.labels):
             label_data = self.labels[idx]
-            return graph_data, {
-                "label": label_data.get("label", 0),
-                "metadata": label_data.get("metadata", {})
-            }
+            metadata = label_data.get("metadata", {})
+            
+            # Extract weak signals from label data
+            weak_signals["bandit_score"] = metadata.get("bandit_score", 0.0)
+            weak_signals["bandit_rules"] = metadata.get("bandit_rules", [])
+            weak_signals["patched_flag"] = metadata.get("patched_flag", False)
+            weak_signals["synthetic_flag"] = metadata.get("synthetic_flag", False)
+            weak_signals["metadata"] = metadata
+            
+            # Compute risk_score from weak signals
+            # Priority: explicit risk_score > bandit_score > patched_flag > default
+            if "risk_score" in label_data:
+                weak_signals["risk_score"] = float(label_data["risk_score"])
+            elif "bandit_score" in metadata:
+                weak_signals["risk_score"] = float(metadata["bandit_score"])
+            elif weak_signals["patched_flag"]:
+                # Pre-patch samples have higher risk (if not explicitly marked as post-patch)
+                if not metadata.get("is_post_patch", False):
+                    weak_signals["risk_score"] = 0.8  # Pre-patch: higher risk
+                else:
+                    weak_signals["risk_score"] = 0.2  # Post-patch: lower risk
+            elif weak_signals["synthetic_flag"]:
+                weak_signals["risk_score"] = 0.9  # Synthetic vulnerabilities: high risk
+            else:
+                # Fallback: use bandit_score if available
+                weak_signals["risk_score"] = weak_signals["bandit_score"]
         
         # Priority 2: Use taint records (semi-supervised or taint flow prediction)
-        taint_info = None
-        if self.taint_records:
+        elif self.taint_records:
             file_path = graph_dict.get("file", "")
             matching_records = [
                 r for r in self.taint_records
@@ -266,8 +304,8 @@ class CPGGraphDataset(Dataset):
             ]
             
             if matching_records:
-                # For now, use the first matching record
-                # In the future, we might want to aggregate multiple records
+                # Taint records indicate potential vulnerability
+                weak_signals["risk_score"] = 0.7  # Medium-high risk
                 record = matching_records[0]
                 
                 # Map positions to node IDs
@@ -285,12 +323,19 @@ class CPGGraphDataset(Dataset):
                 src_id, sink_id, path_ids, meta = map_taint_record(cpg_graph, record)
                 
                 if src_id is not None and sink_id is not None:
-                    taint_info = {
+                    weak_signals["metadata"]["taint_info"] = {
                         "source_id": src_id,
                         "sink_id": sink_id,
                         "path_ids": path_ids,
                         "meta": meta,
                     }
         
-        return graph_data, taint_info
+        # Extract project information for project-wise splitting
+        file_path = graph_dict.get("file", "")
+        if "/" in file_path:
+            # Assume format: project_name/path/to/file.py
+            project = file_path.split("/")[0]
+            weak_signals["project"] = project
+        
+        return graph_data, weak_signals
 

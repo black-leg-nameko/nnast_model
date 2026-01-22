@@ -127,13 +127,15 @@ class DynamicAttentionFusionLayer(nn.Module):
 
 class CPGTaintFlowModel(nn.Module):
     """
-    Graph Neural Network model for predicting taint flows in CPG graphs.
+    Graph Neural Network model for vulnerability risk scoring on CPG graphs.
     
     Architecture:
     - Node embeddings: CodeBERT embeddings (768-dim)
     - GNN layers: Graph Convolutional Networks or Graph Attention Networks
     - Pooling: Mean/Max pooling for graph-level representation
-    - Output: Binary classification (taint flow exists or not)
+    - Output: Risk score (real-valued) ∈ ℝ
+    
+    Following NNAST training strategy: No binary classification, only risk ranking.
     """
     
     def __init__(
@@ -141,20 +143,18 @@ class CPGTaintFlowModel(nn.Module):
         input_dim: int = 768,  # CodeBERT embedding dimension
         hidden_dim: int = 256,
         num_layers: int = 3,
-        num_classes: int = 2,  # Binary classification
         gnn_type: str = "GAT",  # "GCN" or "GAT" (GAT recommended for dynamic attention)
         dropout: float = 0.5,
         use_batch_norm: bool = True,
         use_dynamic_attention: bool = True,  # Enable dynamic attention fusion
     ):
         """
-        Initialize CPG Taint Flow Model with dynamic attention mechanism.
+        Initialize CPG Risk Scoring Model with dynamic attention mechanism.
         
         Args:
             input_dim: Input node embedding dimension (CodeBERT: 768)
             hidden_dim: Hidden dimension for GNN layers
             num_layers: Number of GNN layers
-            num_classes: Number of output classes
             gnn_type: Type of GNN ("GCN" or "GAT")
             dropout: Dropout rate
             use_batch_norm: Whether to use batch normalization
@@ -165,7 +165,6 @@ class CPGTaintFlowModel(nn.Module):
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
-        self.num_classes = num_classes
         self.gnn_type = gnn_type
         self.dropout = dropout
         self.use_dynamic_attention = use_dynamic_attention
@@ -217,14 +216,16 @@ class CPGTaintFlowModel(nn.Module):
         # GNN output: hidden_dim * 2 (mean + max pooling)
         # CodeBERT semantic: input_dim (pooled CodeBERT embeddings)
         self.pool_dim = hidden_dim * 2 + input_dim  # Mean + Max pooling + CodeBERT semantic
-        self.classifier = nn.Sequential(
+        # Regression head: output single risk score
+        self.regressor = nn.Sequential(
             nn.Linear(self.pool_dim, hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim // 2, num_classes)
+            nn.Linear(hidden_dim // 2, 1),  # Single output: risk score
+            nn.Sigmoid()  # Constrain output to [0, 1] range
         )
     
     def forward(self, data: Batch) -> torch.Tensor:
@@ -240,7 +241,7 @@ class CPGTaintFlowModel(nn.Module):
             data: PyTorch Geometric Batch object with 'codebert_emb' attribute
             
         Returns:
-            Logits tensor (batch_size, num_classes)
+            Risk scores tensor (batch_size, 1) - values in [0, 1]
         """
         x, edge_index, batch = data.x, data.edge_index, data.batch
         
@@ -290,10 +291,10 @@ class CPGTaintFlowModel(nn.Module):
         # 3. Combine GNN structural and CodeBERT semantic representations
         x_pooled = torch.cat([x_gnn_pooled, codebert_semantic], dim=1)  # (batch_size, pool_dim)
         
-        # Classification
-        logits = self.classifier(x_pooled)
+        # Regression: output risk score
+        risk_scores = self.regressor(x_pooled)  # (batch_size, 1)
         
-        return logits
+        return risk_scores.squeeze(-1)  # (batch_size,)
     
     def reset_parameters(self):
         """Reset model parameters for re-initialization."""
