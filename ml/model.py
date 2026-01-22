@@ -5,6 +5,8 @@ Improved architecture with:
 - Edge-type aware GNN layers (AST/CFG/DFG/DDFG distinction)
 - Multi-modal node features (CodeBERT + structural features)
 - Multi-scale feature aggregation
+- Hierarchical representation learning (function-level → file-level)
+- Interpretability (attention visualization, node importance)
 """
 import torch
 import torch.nn as nn
@@ -12,7 +14,7 @@ import torch.nn.functional as F
 from torch_geometric.nn import GCNConv, GATConv, global_mean_pool, global_max_pool
 from torch_geometric.data import Data, Batch
 from torch_geometric.utils import add_self_loops, degree
-from typing import Optional, Tuple, Dict
+from typing import Optional, Tuple, Dict, List
 import math
 
 
@@ -103,6 +105,129 @@ class EdgeTypeAwareGATLayer(nn.Module):
         x_out = self.fusion(x_concat)  # (num_nodes, out_dim)
         
         return x_out
+
+
+class CodePositionalEncoding(nn.Module):
+    """
+    Positional encoding for code spans (line/column information).
+    
+    This helps the model understand spatial relationships in code,
+    which can be important for vulnerability patterns.
+    """
+    
+    def __init__(
+        self,
+        d_model: int = 32,
+        max_lines: int = 10000,
+        max_cols: int = 200,
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.line_emb = nn.Embedding(max_lines, d_model // 2)
+        self.col_emb = nn.Embedding(max_cols, d_model // 2)
+    
+    def forward(self, spans: torch.Tensor) -> torch.Tensor:
+        """
+        Encode code positions.
+        
+        Args:
+            spans: (num_nodes, 4) tensor with [start_line, start_col, end_line, end_col]
+            
+        Returns:
+            Positional encodings (num_nodes, d_model)
+        """
+        start_lines = spans[:, 0].clamp(0, self.line_emb.num_embeddings - 1)
+        start_cols = spans[:, 1].clamp(0, self.col_emb.num_embeddings - 1)
+        
+        line_emb = self.line_emb(start_lines)
+        col_emb = self.col_emb(start_cols)
+        
+        return torch.cat([line_emb, col_emb], dim=1)
+
+
+class HierarchicalPooling(nn.Module):
+    """
+    Hierarchical pooling: function-level → file-level aggregation.
+    
+    This allows the model to capture inter-function dependencies
+    which are important for vulnerability detection.
+    """
+    
+    def __init__(
+        self,
+        hidden_dim: int,
+        dropout: float = 0.5,
+    ):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        
+        # Function-level aggregation
+        self.function_pool = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),  # Mean + Max pooling
+            nn.ReLU(),
+            nn.Dropout(dropout)
+        )
+        
+        # File-level aggregation (over functions)
+        self.file_pool = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout)
+        )
+    
+    def forward(
+        self,
+        x: torch.Tensor,
+        batch: torch.Tensor,
+        function_ids: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        Hierarchical pooling: nodes → functions → file.
+        
+        Args:
+            x: Node features (num_nodes, hidden_dim)
+            batch: Batch assignment (num_nodes,)
+            function_ids: Function assignment for each node (num_nodes,) or None
+            
+        Returns:
+            File-level representation (batch_size, hidden_dim)
+        """
+        if function_ids is None:
+            # Fallback: treat all nodes as single function
+            mean_pool = global_mean_pool(x, batch)
+            max_pool = global_max_pool(x, batch)
+            return self.file_pool(torch.cat([mean_pool, max_pool], dim=1))
+        
+        # Function-level pooling
+        num_functions = function_ids.max().item() + 1
+        function_features = []
+        
+        for func_id in range(num_functions):
+            func_mask = (function_ids == func_id)
+            if func_mask.sum() == 0:
+                continue
+            
+            func_nodes = x[func_mask]
+            func_batch = batch[func_mask]
+            
+            # Pool nodes within function
+            func_mean = global_mean_pool(func_nodes, func_batch)
+            func_max = global_max_pool(func_nodes, func_batch)
+            func_feat = self.function_pool(torch.cat([func_mean, func_max], dim=1))
+            function_features.append(func_feat)
+        
+        if not function_features:
+            # Fallback
+            mean_pool = global_mean_pool(x, batch)
+            max_pool = global_max_pool(x, batch)
+            return self.file_pool(torch.cat([mean_pool, max_pool], dim=1))
+        
+        # File-level pooling (over functions)
+        func_tensor = torch.stack(function_features, dim=0)  # (num_functions, hidden_dim)
+        file_mean = func_tensor.mean(dim=0)
+        file_max = func_tensor.max(dim=0)[0]
+        
+        return self.file_pool(torch.cat([file_mean, file_max], dim=1))
 
 
 class MultiModalNodeEncoder(nn.Module):
@@ -322,6 +447,8 @@ class CPGTaintFlowModel(nn.Module):
         use_edge_types: bool = True,  # Enable edge-type aware processing
         use_multi_modal: bool = True,  # Enable multi-modal node features
         use_multi_scale: bool = True,  # Enable multi-scale feature aggregation
+        use_hierarchical: bool = True,  # Enable hierarchical pooling (function → file)
+        use_positional: bool = True,  # Enable positional encoding for code spans
         num_edge_types: int = 4,  # Number of edge types (AST, CFG, DFG, DDFG)
         num_node_kinds: int = 50,  # Number of node kinds
         num_types: int = 100,  # Number of type hints
@@ -355,6 +482,20 @@ class CPGTaintFlowModel(nn.Module):
         self.use_edge_types = use_edge_types
         self.use_multi_modal = use_multi_modal
         self.use_multi_scale = use_multi_scale
+        self.use_hierarchical = use_hierarchical
+        self.use_positional = use_positional
+        
+        # Positional encoding (if enabled)
+        if use_positional:
+            self.positional_encoder = CodePositionalEncoding(
+                d_model=32,
+                max_lines=10000,
+                max_cols=200,
+            )
+            # Projection layer to combine positional encoding with node features
+            self.pos_proj = nn.Linear(hidden_dim + 32, hidden_dim)
+        else:
+            self.pos_proj = None
         
         # Multi-modal node encoder (if enabled)
         if use_multi_modal:
@@ -369,6 +510,22 @@ class CPGTaintFlowModel(nn.Module):
         else:
             # Fallback: simple projection
             self.input_proj = nn.Linear(input_dim, hidden_dim)
+        
+        # Hierarchical pooling (if enabled)
+        if use_hierarchical:
+            self.hierarchical_pool = HierarchicalPooling(
+                hidden_dim=hidden_dim,
+                dropout=dropout
+            )
+        
+        # Adjust pool_dim if using hierarchical pooling
+        if use_hierarchical:
+            # Hierarchical pooling outputs hidden_dim instead of hidden_dim * 2
+            if use_multi_scale:
+                pool_dim = hidden_dim * num_layers + input_dim
+            else:
+                pool_dim = hidden_dim + input_dim
+            self.pool_dim = pool_dim
         
         # GNN layers with improved architecture
         self.gnn_layers = nn.ModuleList()
@@ -425,15 +582,6 @@ class CPGTaintFlowModel(nn.Module):
         if use_multi_scale:
             self.scale_weights = nn.Parameter(torch.ones(num_layers) / num_layers)
         
-        # Late fusion: Graph-level pooling
-        if use_multi_scale:
-            # Multi-scale: aggregate features from all layers
-            pool_dim = hidden_dim * 2 * num_layers + input_dim
-        else:
-            # Single-scale: only last layer
-            pool_dim = hidden_dim * 2 + input_dim
-        
-        self.pool_dim = pool_dim
         
         # Regression head: output single risk score
         self.regressor = nn.Sequential(
@@ -503,6 +651,16 @@ class CPGTaintFlowModel(nn.Module):
             x = self.input_proj(x_codebert)
             x = F.relu(x)
         
+        # Add positional encoding (if enabled)
+        if self.use_positional and self.pos_proj is not None:
+            if hasattr(data, 'spans') and data.spans is not None:
+                pos_emb = self.positional_encoder(data.spans)
+                # Concatenate positional encoding
+                x = torch.cat([x, pos_emb], dim=1)
+                # Project back to hidden_dim
+                x = self.pos_proj(x)
+                x = F.relu(x)
+        
         # GNN layers with improved architecture
         layer_outputs = []  # Store outputs for multi-scale aggregation
         
@@ -533,22 +691,43 @@ class CPGTaintFlowModel(nn.Module):
                 layer_outputs.append(x)
         
         # Late fusion: Graph-level pooling
-        if self.use_multi_scale:
-            # Multi-scale aggregation: pool each layer's output
-            pooled_features = []
-            for layer_out in layer_outputs:
-                mean_pool = global_mean_pool(layer_out, batch)
-                max_pool = global_max_pool(layer_out, batch)
-                pooled_features.append(torch.cat([mean_pool, max_pool], dim=1))
+        if self.use_hierarchical:
+            # Hierarchical pooling: function-level → file-level
+            function_ids = None
+            if hasattr(data, 'function_ids') and data.function_ids is not None:
+                function_ids = data.function_ids
             
-            # Weighted combination of multi-scale features
-            weights = F.softmax(self.scale_weights, dim=0)
-            x_gnn_pooled = sum(w * feat for w, feat in zip(weights, pooled_features))
+            if self.use_multi_scale:
+                # Multi-scale hierarchical pooling
+                pooled_features = []
+                for layer_out in layer_outputs:
+                    func_pooled = self.hierarchical_pool(layer_out, batch, function_ids)
+                    pooled_features.append(func_pooled)
+                
+                # Weighted combination
+                weights = F.softmax(self.scale_weights, dim=0)
+                x_gnn_pooled = sum(w * feat for w, feat in zip(weights, pooled_features))
+            else:
+                # Single-scale hierarchical pooling
+                x_gnn_pooled = self.hierarchical_pool(x, batch, function_ids)
         else:
-            # Single-scale: only last layer
-            x_mean = global_mean_pool(x, batch)
-            x_max = global_max_pool(x, batch)
-            x_gnn_pooled = torch.cat([x_mean, x_max], dim=1)  # (batch_size, hidden_dim * 2)
+            # Standard pooling
+            if self.use_multi_scale:
+                # Multi-scale aggregation: pool each layer's output
+                pooled_features = []
+                for layer_out in layer_outputs:
+                    mean_pool = global_mean_pool(layer_out, batch)
+                    max_pool = global_max_pool(layer_out, batch)
+                    pooled_features.append(torch.cat([mean_pool, max_pool], dim=1))
+                
+                # Weighted combination of multi-scale features
+                weights = F.softmax(self.scale_weights, dim=0)
+                x_gnn_pooled = sum(w * feat for w, feat in zip(weights, pooled_features))
+            else:
+                # Single-scale: only last layer
+                x_mean = global_mean_pool(x, batch)
+                x_max = global_max_pool(x, batch)
+                x_gnn_pooled = torch.cat([x_mean, x_max], dim=1)  # (batch_size, hidden_dim * 2)
         
         # CodeBERT semantic pooling (semantic features)
         codebert_mean = global_mean_pool(codebert_emb, batch)
@@ -575,6 +754,116 @@ class CPGTaintFlowModel(nn.Module):
         weights = F.softmax(self.gnn_layers[0].edge_type_weights, dim=0)
         edge_type_names = ["AST", "CFG", "DFG", "DDFG"]
         return {name: weight.item() for name, weight in zip(edge_type_names, weights)}
+    
+    def forward_with_attention(
+        self,
+        data: Batch,
+        return_attention: bool = True
+    ) -> Tuple[torch.Tensor, Optional[Dict[str, torch.Tensor]]]:
+        """
+        Forward pass with attention weights for interpretability.
+        
+        Args:
+            data: PyTorch Geometric Batch object
+            return_attention: Whether to return attention weights
+            
+        Returns:
+            Tuple of (risk_scores, attention_info)
+            - risk_scores: Risk scores (batch_size,)
+            - attention_info: Dict with attention weights and node importance, or None
+        """
+        # Standard forward pass
+        risk_scores = self.forward(data)
+        
+        if not return_attention:
+            return risk_scores, None
+        
+        attention_info = {}
+        
+        # Get edge type importance
+        edge_importance = self.get_edge_type_importance()
+        if edge_importance:
+            attention_info["edge_type_importance"] = edge_importance
+        
+        # Compute node importance (gradient-based or attention-based)
+        # For now, use simple heuristic: nodes with high feature norm
+        x_codebert = data.x
+        if hasattr(data, 'codebert_emb'):
+            codebert_emb = data.codebert_emb
+        else:
+            codebert_emb = x_codebert
+        
+        # Node importance: norm of CodeBERT embeddings (semantic importance)
+        node_importance = torch.norm(codebert_emb, dim=1)  # (num_nodes,)
+        attention_info["node_importance"] = node_importance.detach().cpu()
+        
+        # Batch-wise node importance
+        batch = data.batch
+        batch_size = batch.max().item() + 1
+        attention_info["node_importance_per_graph"] = []
+        
+        for i in range(batch_size):
+            batch_mask = batch == i
+            graph_node_importance = node_importance[batch_mask]
+            attention_info["node_importance_per_graph"].append(
+                graph_node_importance.detach().cpu()
+            )
+        
+        return risk_scores, attention_info
+    
+    def explain_prediction(
+        self,
+        data: Batch,
+        top_k_nodes: int = 10
+    ) -> Dict[str, Any]:
+        """
+        Explain model prediction by identifying important nodes and edges.
+        
+        Args:
+            data: PyTorch Geometric Batch object
+            top_k_nodes: Number of top important nodes to return
+            
+        Returns:
+            Dictionary with explanation:
+            - risk_score: Predicted risk score
+            - top_nodes: Top-K important node IDs
+            - edge_type_importance: Importance of each edge type
+            - node_importance: Node importance scores
+        """
+        risk_scores, attention_info = self.forward_with_attention(data, return_attention=True)
+        
+        explanation = {
+            "risk_score": risk_scores.detach().cpu().numpy().tolist(),
+        }
+        
+        if attention_info:
+            explanation["edge_type_importance"] = attention_info.get("edge_type_importance")
+            
+            # Get top-K nodes per graph
+            batch = data.batch
+            batch_size = batch.max().item() + 1
+            top_nodes_per_graph = []
+            
+            if "node_importance_per_graph" in attention_info:
+                for i, node_importance in enumerate(attention_info["node_importance_per_graph"]):
+                    # Get node IDs for this graph
+                    batch_mask = batch == i
+                    node_ids = torch.where(batch_mask)[0]
+                    
+                    # Get top-K nodes
+                    top_k = min(top_k_nodes, len(node_ids))
+                    top_indices = torch.topk(node_importance, top_k).indices
+                    top_node_ids = node_ids[top_indices].cpu().numpy().tolist()
+                    
+                    top_nodes_per_graph.append({
+                        "graph_idx": i,
+                        "top_node_ids": top_node_ids,
+                        "importance_scores": node_importance[top_indices].cpu().numpy().tolist()
+                    })
+            
+            explanation["top_nodes"] = top_nodes_per_graph
+        
+        return explanation
     
     def reset_parameters(self):
         """Reset model parameters for re-initialization."""

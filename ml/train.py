@@ -606,7 +606,7 @@ def main():
     )
     
     # Initialize model (risk scoring regression with improved architecture)
-    print("Initializing improved risk scoring model...")
+    print("Initializing improved risk scoring model (Phase 1 + Phase 2)...")
     model = CPGTaintFlowModel(
         input_dim=768,
         hidden_dim=args.hidden_dim,
@@ -617,6 +617,8 @@ def main():
         use_edge_types=True,  # Enable edge-type aware processing (AST/CFG/DFG/DDFG)
         use_multi_modal=True,  # Enable multi-modal node features (CodeBERT + structural)
         use_multi_scale=True,  # Enable multi-scale feature aggregation
+        use_hierarchical=True,  # Enable hierarchical pooling (function → file)
+        use_positional=True,  # Enable positional encoding for code spans
         num_edge_types=4,  # AST, CFG, DFG, DDFG
         num_node_kinds=50,  # Approximate number of node kinds
         num_types=100,  # Approximate number of type hints
@@ -627,6 +629,8 @@ def main():
     print(f"  - Edge-type aware: {model.use_edge_types}")
     print(f"  - Multi-modal nodes: {model.use_multi_modal}")
     print(f"  - Multi-scale aggregation: {model.use_multi_scale}")
+    print(f"  - Hierarchical pooling: {model.use_hierarchical}")
+    print(f"  - Positional encoding: {model.use_positional}")
     
     # Print edge type importance (if available)
     edge_importance = model.get_edge_type_importance()
