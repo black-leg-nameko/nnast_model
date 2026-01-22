@@ -17,43 +17,10 @@ import requests
 # Import existing modules
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from cli import main as cpg_main
 from ml.inference import run_inference, load_model, generate_cpg_from_file
 from local.masking import create_minimized_payload, generate_fingerprint
 from local.github_issue import create_issues_from_reports
-
-
-def build_full_cpg(repo_path: Path, output_path: Path) -> Dict[str, Any]:
-    """
-    Build full CPG
-    
-    Args:
-        repo_path: Repository path
-        output_path: CPG output path
-        
-    Returns:
-        CPG graph (dictionary format)
-    """
-    # Build CPG (using existing cli.py)
-    # Simple implementation: actually calls cli.py
-    import subprocess
-    
-    result = subprocess.run(
-        [sys.executable, "-m", "cli", str(repo_path), "--out", str(output_path)],
-        capture_output=True,
-        text=True
-    )
-    
-    if result.returncode != 0:
-        raise RuntimeError(f"CPG build failed: {result.stderr}")
-    
-    # Read CPG
-    with open(output_path, 'r') as f:
-        lines = f.readlines()
-        if lines:
-            return json.loads(lines[0])
-    
-    return {"nodes": [], "edges": []}
+from local.cpg_builder import build_full_cpg
 
 
 def run_gnn_inference(
@@ -254,8 +221,14 @@ def main():
     cpg_output = args.cpg_cache_dir / "cpg.jsonl"
     cpg_output.parent.mkdir(parents=True, exist_ok=True)
     
-    cpg_graph = build_full_cpg(args.repo_path, cpg_output)
-    print(f"  CPG built: {len(cpg_graph.get('nodes', []))} nodes, {len(cpg_graph.get('edges', []))} edges")
+    # Use Rust implementation if available, fallback to Python
+    try:
+        cpg_graph = build_full_cpg(args.repo_path, cpg_output, use_cache=True)
+        implementation = "Rust" if hasattr(sys.modules.get('cpg_rust'), 'build_cpg') else "Python"
+        print(f"  CPG built ({implementation}): {len(cpg_graph.get('nodes', []))} nodes, {len(cpg_graph.get('edges', []))} edges")
+    except Exception as e:
+        print(f"  Error building CPG: {e}", file=sys.stderr)
+        raise
     
     # 2. GNN inference
     print("[2/6] Running GNN inference...")
