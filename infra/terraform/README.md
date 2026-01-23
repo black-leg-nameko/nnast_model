@@ -36,7 +36,7 @@ Edit `terraform.tfvars` and modify settings according to your environment.
 ### 3. Initialize Terraform
 
 ```bash
-cd terraform
+cd infra/terraform
 terraform init
 ```
 

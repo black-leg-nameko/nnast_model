@@ -1,0 +1,34 @@
+version: '3.8'
+
+services:
+  admin-api:
+    build:
+      context: ./go
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      - ENVIRONMENT=dev
+      - JWT_SECRET=your-secret-key-change-in-production
+      - PORT=8080
+    volumes:
+      - ~/.aws:/root/.aws:ro
+    networks:
+      - nnast-admin
+
+  admin-frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:80"
+    depends_on:
+      - admin-api
+    environment:
+      - VITE_API_BASE_URL=http://localhost:8080/api/v1
+    networks:
+      - nnast-admin
+
+networks:
+  nnast-admin:
+    driver: bridge

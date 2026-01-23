@@ -1,4 +1,4 @@
-# NNAST Cloud Services
+# NNAST Services
 
 このディレクトリには、NNASTクラウドサービスの実装が含まれています。
 
@@ -70,7 +70,7 @@ docker push <account-id>.dkr.ecr.ap-northeast-1.amazonaws.com/nnast/report-servi
 
 ### 3. TerraformでECSタスク定義を更新
 
-`terraform/modules/ecs/main.tf`の`auth_service_image`と`report_service_image`をECRのURIに更新し、`terraform apply`を実行。
+`infra/terraform/modules/ecs/main.tf`の`auth_service_image`と`report_service_image`をECRのURIに更新し、`terraform apply`を実行。
 
 ## 環境変数
 
