@@ -5,6 +5,7 @@ from typing import Optional
 
 from cpg.parse import parse_source
 from cpg.build_ast import ASTCPGBuilder
+from cpg.pattern_matcher import PatternMatcher
 from ir.schema import CPGGraph
 from ir.io import write_graph_jsonl, iter_taint_records
 from ir.taint_merge import add_ddfg_from_records
@@ -39,6 +40,16 @@ def main(argv: Optional[list[str]] = None) -> int:
         ),
     )
     parser.add_argument(
+        "--patterns",
+        help="Path to patterns.yaml file (default: patterns.yaml in project root)",
+        default=None,
+    )
+    parser.add_argument(
+        "--no-patterns",
+        action="store_true",
+        help="Disable pattern matching (skip source/sink/sanitizer detection)",
+    )
+    parser.add_argument(
         "--verbose", "-v", action="store_true", help="Enable verbose output (show debug messages)"
     )
     parser.add_argument("--quiet", "-q", action="store_true", help="Suppress non-error output")
@@ -51,6 +62,21 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     out = pathlib.Path(args.out)
     taint_log: Optional[str] = args.taint_log
+
+    # Initialize pattern matcher (if not disabled)
+    pattern_matcher = None
+    if not args.no_patterns:
+        try:
+            patterns_path = pathlib.Path(args.patterns) if args.patterns else None
+            pattern_matcher = PatternMatcher(patterns_path)
+            log(f"Loaded pattern matcher from {pattern_matcher.patterns_yaml_path}", verbose=args.verbose)
+        except FileNotFoundError as e:
+            log(f"Warning: {e}. Pattern matching disabled.", level="ERROR" if args.verbose else "INFO")
+        except Exception as e:
+            log(f"Warning: Failed to load pattern matcher: {e}. Pattern matching disabled.", level="ERROR")
+            if args.verbose:
+                import traceback
+                traceback.print_exc()
 
     # Ensure output directory exists
     if out.parent != pathlib.Path(".") and not out.parent.exists():
@@ -89,13 +115,19 @@ def main(argv: Optional[list[str]] = None) -> int:
         try:
             src = py.read_text(encoding="utf-8")
             tree = parse_source(src)
-            builder = ASTCPGBuilder(str(py), src)
+            builder = ASTCPGBuilder(str(py), src, pattern_matcher=pattern_matcher)
             builder.visit(tree)
 
+            # Add framework metadata to graph
+            graph_metadata = {}
+            if builder.pattern_matcher and builder._frameworks:
+                graph_metadata["frameworks"] = list(builder._frameworks)
+            
             graph = CPGGraph(
                 file=str(py),
                 nodes=builder.nodes,
                 edges=builder.edges,
+                metadata=graph_metadata if graph_metadata else None,
             )
 
             # Optionally merge dynamic data-flow (DDFG) edges from taint records.

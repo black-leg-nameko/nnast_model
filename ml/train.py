@@ -24,91 +24,12 @@ from tqdm import tqdm
 from ml.model import CPGTaintFlowModel, CPGNodePairModel
 from ml.dataset import CPGGraphDataset
 from ml.embed_codebert import CodeBERTEmbedder
-from sklearn.metrics import (
-    roc_auc_score, average_precision_score,
-    precision_recall_curve, roc_curve
+from ml.evaluation import (
+    calculate_classification_metrics,
+    format_metrics_report,
+    calculate_framework_metrics
 )
-
-
-def project_wise_split(
-    dataset: CPGGraphDataset,
-    train_ratio: float = 0.6,
-    val_ratio: float = 0.2,
-    test_ratio: float = 0.2,
-    seed: int = 42
-) -> Tuple[Subset, Subset, Subset]:
-    """
-    Split dataset by project (mandatory for NNAST strategy).
-    
-    Ensures no file, function, or commit leakage across splits.
-    
-    Args:
-        dataset: CPGGraphDataset instance
-        train_ratio: Ratio for training set
-        val_ratio: Ratio for validation set
-        test_ratio: Ratio for test set
-        seed: Random seed for reproducibility
-        
-    Returns:
-        Tuple of (train_subset, val_subset, test_subset)
-    """
-    # Verify ratios sum to 1.0
-    assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-6, \
-        "Ratios must sum to 1.0"
-    
-    # Group samples by project
-    project_to_indices = defaultdict(list)
-    for idx in range(len(dataset)):
-        try:
-            _, weak_signals = dataset[idx]
-            project = weak_signals.get("project", "unknown")
-            project_to_indices[project].append(idx)
-        except Exception:
-            # Fallback: use file path
-            graph_dict = dataset.graphs[idx]
-            file_path = graph_dict.get("file", "")
-            project = file_path.split("/")[0] if "/" in file_path else "unknown"
-            project_to_indices[project].append(idx)
-    
-    # Get list of projects
-    projects = list(project_to_indices.keys())
-    np.random.seed(seed)
-    np.random.shuffle(projects)
-    
-    # Split projects (not samples)
-    n_projects = len(projects)
-    n_train = int(n_projects * train_ratio)
-    n_val = int(n_projects * val_ratio)
-    
-    train_projects = set(projects[:n_train])
-    val_projects = set(projects[n_train:n_train + n_val])
-    test_projects = set(projects[n_train + n_val:])
-    
-    # Collect indices for each split
-    train_indices = []
-    val_indices = []
-    test_indices = []
-    
-    for project, indices in project_to_indices.items():
-        if project in train_projects:
-            train_indices.extend(indices)
-        elif project in val_projects:
-            val_indices.extend(indices)
-        elif project in test_projects:
-            test_indices.extend(indices)
-        else:
-            # Fallback: assign to train
-            train_indices.extend(indices)
-    
-    print(f"Project-wise split:")
-    print(f"  Projects: {len(train_projects)} train, {len(val_projects)} val, {len(test_projects)} test")
-    print(f"  Samples: {len(train_indices)} train, {len(val_indices)} val, {len(test_indices)} test")
-    
-    return (
-        Subset(dataset, train_indices),
-        Subset(dataset, val_indices),
-        Subset(dataset, test_indices)
-    )
+from sklearn.metrics import f1_score, precision_score, recall_score
 
 
 def collate_fn(batch):
@@ -386,26 +307,57 @@ def evaluate(
             mse = nn.functional.mse_loss(risk_scores, target_scores).item()
             total_mse += mse
             
-            # Collect for metrics
-            all_risk_scores.extend(risk_scores.cpu().numpy())
-            all_target_scores.extend(target_scores.cpu().numpy())
-            all_weak_signals.extend(batch_weak_signals)
+            # Collect predictions, labels, and probabilities for metrics
+            all_preds.extend(pred.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+            
+            # Get probabilities for PR-AUC calculation
+            probs = torch.softmax(logits, dim=1)
+            all_probs.extend(probs[:, 1].cpu().numpy())  # Probability of vulnerable class
     
     avg_loss = total_loss / len(dataloader)
     avg_mse = total_mse / len(dataloader)
     
-    # Compute ranking metrics
-    risk_scores_array = np.array(all_risk_scores)
-    target_scores_array = np.array(all_target_scores)
-    ranking_metrics = compute_ranking_metrics(risk_scores_array, target_scores_array)
+    # Calculate comprehensive metrics using evaluation module
+    y_true = np.array(all_labels)
+    y_pred = np.array(all_preds)
+    y_proba = np.array(all_probs) if all_probs else None
     
-    metrics = {
-        "loss": avg_loss,
-        "mse": avg_mse,
-        **ranking_metrics
-    }
-    
-    return metrics
+    # Calculate comprehensive metrics
+    if len(set(all_labels)) > 1:  # Only if we have both classes
+        metrics = calculate_classification_metrics(
+            y_true, y_pred, y_proba,
+            class_names=["safe", "vulnerable"]
+        )
+        
+        # Keep backward compatibility with old metric names
+        return {
+            "loss": avg_loss,
+            "accuracy": accuracy,
+            "f1": metrics.get("f1_binary", 0.0),
+            "precision": metrics.get("precision_binary", 0.0),
+            "recall": metrics.get("recall_binary", 0.0),
+            # New comprehensive metrics
+            "f1_macro": metrics.get("f1_macro", 0.0),
+            "precision_macro": metrics.get("precision_macro", 0.0),
+            "recall_macro": metrics.get("recall_macro", 0.0),
+            "f1_per_class": metrics.get("f1_per_class", {}),
+            "pr_auc": metrics.get("pr_auc"),
+            **metrics  # Include all other metrics
+        }
+    else:
+        return {
+            "loss": avg_loss,
+            "accuracy": accuracy,
+            "f1": 0.0,
+            "precision": 0.0,
+            "recall": 0.0,
+            "f1_macro": 0.0,
+            "precision_macro": 0.0,
+            "recall_macro": 0.0,
+            "f1_per_class": {},
+            "pr_auc": None
+        }
 
 
 def main():
@@ -677,13 +629,12 @@ def main():
         "train_loss": [],
         "train_mse": [],
         "val_loss": [],
-        "val_mse": [],
-        "val_auroc": [],
-        "val_auprc": [],
-        "val_recall@5": [],
-        "val_recall@10": [],
-        "val_precision@5": [],
-        "val_precision@10": [],
+        "val_acc": [],
+        "val_f1": [],
+        "val_precision": [],
+        "val_recall": [],
+        "val_f1_macro": [],
+        "val_pr_auc": [],
     }
     
     print("\nStarting training...")
@@ -710,18 +661,19 @@ def main():
             f"Val MSE: {val_metrics['mse']:.4f}, "
             f"LR: {current_lr:.2e}"
         )
-        print(
-            f"  Val AUROC: {val_metrics.get('auroc', 0.0):.4f}, "
-            f"AUPRC: {val_metrics.get('auprc', 0.0):.4f}"
-        )
-        print(
-            f"  Val Recall@5: {val_metrics.get('recall@5', 0.0):.4f}, "
-            f"Recall@10: {val_metrics.get('recall@10', 0.0):.4f}"
-        )
-        print(
-            f"  Val Precision@5: {val_metrics.get('precision@5', 0.0):.4f}, "
-            f"Precision@10: {val_metrics.get('precision@10', 0.0):.4f}"
-        )
+        if 'f1' in val_metrics:
+            print(
+                f"  Val F1: {val_metrics['f1']:.4f}, "
+                f"Precision: {val_metrics['precision']:.4f}, "
+                f"Recall: {val_metrics['recall']:.4f}"
+            )
+            if 'f1_macro' in val_metrics:
+                print(
+                    f"  Val Macro-F1: {val_metrics['f1_macro']:.4f}, "
+                    f"PR-AUC: {val_metrics.get('pr_auc', 'N/A')}"
+                )
+            if 'f1_per_class' in val_metrics and val_metrics['f1_per_class']:
+                print(f"  Per-class F1: {val_metrics['f1_per_class']}")
         
         # Debug: Check if model is learning
         if epoch == 1:
@@ -737,13 +689,14 @@ def main():
         history["train_loss"].append(train_metrics["loss"])
         history["train_mse"].append(train_metrics["mse"])
         history["val_loss"].append(val_metrics["loss"])
-        history["val_mse"].append(val_metrics["mse"])
-        history["val_auroc"].append(val_metrics.get("auroc", 0.0))
-        history["val_auprc"].append(val_metrics.get("auprc", 0.0))
-        history["val_recall@5"].append(val_metrics.get("recall@5", 0.0))
-        history["val_recall@10"].append(val_metrics.get("recall@10", 0.0))
-        history["val_precision@5"].append(val_metrics.get("precision@5", 0.0))
-        history["val_precision@10"].append(val_metrics.get("precision@10", 0.0))
+        history["val_acc"].append(val_metrics["accuracy"])
+        if "f1" in val_metrics:
+            history["val_f1"].append(val_metrics["f1"])
+            history["val_precision"].append(val_metrics["precision"])
+            history["val_recall"].append(val_metrics["recall"])
+            history["val_f1_macro"].append(val_metrics.get("f1_macro", 0.0))
+            pr_auc = val_metrics.get("pr_auc")
+            history["val_pr_auc"].append(pr_auc if pr_auc is not None else 0.0)
         
         # Save checkpoint
         checkpoint = {
