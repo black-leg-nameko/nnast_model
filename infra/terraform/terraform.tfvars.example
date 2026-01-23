@@ -1,0 +1,30 @@
+# Copy this file to terraform.tfvars and customize
+
+aws_region = "ap-northeast-1"
+environment = "dev"
+
+vpc_cidr = "10.0.0.0/16"
+
+bedrock_model_id = "anthropic.claude-3-sonnet-20240229-v1:0"
+
+github_oidc_issuer = "https://token.actions.githubusercontent.com"
+github_oidc_audience = "nnast-cloud"
+
+top_k_findings = 5
+max_issues_per_pr = 5
+
+ecs_task_cpu = 512
+ecs_task_memory = 1024
+ecs_desired_count = 2
+ecs_max_count = 10
+
+enable_cloudtrail = true
+
+# Terraform backend configuration (uncomment and configure)
+# terraform {
+#   backend "s3" {
+#     bucket = "nnast-terraform-state"
+#     key    = "nnast/terraform.tfstate"
+#     region = "ap-northeast-1"
+#   }
+# }

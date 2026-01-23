@@ -5,6 +5,10 @@ from ir.schema import CPGNode, CPGEdge
 from cpg.parse import get_span, extract_code
 from cpg.pattern_matcher import PatternMatcher
 
+# デフォルトでRust実装を使用（環境変数で無効化可能）
+# USE_RUST_CPG=false でPython実装を明示的に使用
+USE_RUST = os.getenv("USE_RUST_CPG", "true").lower() not in ("false", "0", "no")
+
 
 KIND_MAP = {
     ast.Module: "Module",
@@ -493,3 +497,84 @@ class ASTCPGBuilder(ast.NodeVisitor):
 
     def build(self) -> Tuple[List[CPGNode], List[CPGEdge]]:
         return self.nodes, self.edges
+
+
+# Rust実装のラッパー（デフォルトで有効化、環境変数で無効化可能）
+if USE_RUST:
+    try:
+        import cpg_rust
+        
+        class ASTCPGBuilderRust:
+            """
+            Rust実装を使用するCPGビルダー
+            既存のASTCPGBuilderと同じインターフェースを提供
+            """
+            
+            def __init__(self, file_path: str, source: str):
+                self.file = file_path
+                self.source = source
+                self.nodes: List[CPGNode] = []
+                self.edges: List[CPGEdge] = []
+                self._built = False
+            
+            def visit(self, tree):
+                """
+                ASTツリーを訪問（互換性のためのメソッド）
+                実際の処理はbuild()で行う
+                """
+                # Rust実装では、ASTツリーの訪問は不要
+                # build()で直接ソースコードからCPGを生成する
+                pass
+            
+            def build(self) -> Tuple[List[CPGNode], List[CPGEdge]]:
+                """
+                CPGグラフを構築
+                既存のASTCPGBuilderと同じインターフェース
+                """
+                if self._built:
+                    return self.nodes, self.edges
+                
+                # Rust実装でCPGを生成
+                graph_dict = cpg_rust.build_cpg(self.file, self.source)
+                
+                # CPGNodeとCPGEdgeのリストに変換
+                self.nodes = []
+                self.edges = []
+                
+                for n in graph_dict["nodes"]:
+                    self.nodes.append(CPGNode(
+                        id=n["id"],
+                        kind=n["kind"],
+                        file=n["file"],
+                        span=n["span"],
+                        code=n.get("code"),
+                        symbol=n.get("symbol"),
+                        type_hint=n.get("type_hint"),
+                        flags=n.get("flags", []),
+                        attrs=n.get("attrs", {})
+                    ))
+                
+                for e in graph_dict["edges"]:
+                    self.edges.append(CPGEdge(
+                        src=e["src"],
+                        dst=e["dst"],
+                        kind=e["kind"],
+                        attrs=e.get("attrs")
+                    ))
+                
+                self._built = True
+                return self.nodes, self.edges
+        
+        # Rust実装を使用
+        ASTCPGBuilder = ASTCPGBuilderRust
+    except ImportError as e:
+        # cpg_rustモジュールが利用できない場合はPython実装を使用
+        import warnings
+        warnings.warn(
+            f"Rust実装（cpg_rust）が利用できません。Python実装を使用します。\n"
+            f"エラー: {e}\n"
+            f"Rust実装を使用するには: cd cpg_rust && maturin develop",
+            UserWarning,
+            stacklevel=2
+        )
+        # Python実装をそのまま使用（USE_RUST = Falseの状態）

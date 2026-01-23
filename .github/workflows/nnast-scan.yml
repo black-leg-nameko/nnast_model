@@ -1,0 +1,77 @@
+name: NNAST Security Scan
+
+on:
+  pull_request:
+    branches: [ main, develop ]
+  push:
+    branches: [ main, develop ]
+
+permissions:
+  contents: read
+  issues: write
+  id-token: write
+  pull-requests: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+      
+      - name: Install maturin
+        run: pip install maturin
+      
+      - name: Build CPG Rust module
+        run: |
+          cd cpg_rust
+          maturin build --release
+          pip install target/wheels/cpg_rust-*.whl
+          cd ..
+      
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install -r local/requirements.txt
+          # PyTorch and PyG (adjust based on your needs)
+          pip install torch torch-geometric transformers
+      
+      - name: Get OIDC token
+        id: oidc
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const token = await core.getIDToken();
+            core.setOutput('token', token);
+      
+      - name: Run NNAST Scan
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ${{ steps.oidc.outputs.token }}
+          GITHUB_SHA: ${{ github.sha }}
+          NNAST_API_URL: ${{ secrets.NNAST_API_URL }}
+          NNAST_TENANT_ID: ${{ secrets.NNAST_TENANT_ID }}
+          NNAST_PROJECT_ID: ${{ secrets.NNAST_PROJECT_ID }}
+        run: |
+          python -m local.scan \
+            . \
+            --api-url "$NNAST_API_URL" \
+            --github-oidc-token "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            --repo "${{ github.repository }}" \
+            --tenant-id "$NNAST_TENANT_ID" \
+            --project-id "$NNAST_PROJECT_ID" \
+            --commit-sha "$GITHUB_SHA" \
+            --top-k 5 \
+            --max-issues 5
