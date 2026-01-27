@@ -52,3 +52,14 @@ training_data_*/
 # Keep dataset structure documentation
 !dataset/README.md
 !dataset/README*.md
+
+# Collected training data
+collected/
+nnast_dataset/
+synthetic_data/
+
+# Related works (papers, PDFs - not for version control)
+related_works/
+
+# Test repositories (not used for training dataset construction)
+test_repos/
